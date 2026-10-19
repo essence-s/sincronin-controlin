@@ -1,5 +1,5 @@
 # Salida de compilación de Cargo.
 #
 # Sin barra inicial a propósito: git aplica el patrón en cualquier nivel,
-# así cubre tanto `<raíz>/target/` como `desktop-rust/target/`.
+# así cubre tanto `<raíz>/target/` como `desktop/target/`.
 target/

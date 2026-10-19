@@ -1,10 +1,16 @@
-// Botón con iconos hechos con texto y rectángulos.
-// Se evitan los elementos `Path` a propósito: el renderizador software (el que
-// se usa cuando no hay aceleración gráfica) no los pinta, y así la barra se ve
-// igual con cualquier renderizador y en cualquier equipo.
+// Botón con un ícono SVG centrado.
+//
+// Los íconos se cargan como imágenes (`@image-url`), no como elementos `Path`:
+// el renderizador software no dibuja `Path`, pero sí rasteriza SVG con resvg,
+// y lo hace al tamaño físico de pantalla (con el scale factor), así que los
+// íconos quedan nítidos en pantallas HiDPI.
+//
+// El color no viene del SVG: se usa `colorize`, que lo trata como máscara
+// alfa. Por eso los archivos son blancos y el tinte se define acá.
 component IconButton inherits Rectangle {
-    // 0 = -10s, 1 = play, 2 = pausa, 3 = +10s, 4 = cerrar
-    in property <int> kind: 1;
+    in property <image> icon;
+    in property <brush> tint: #f2f2f6;
+    in property <length> icon-size: 22px;
     in property <bool> active: true;
     callback clicked();
 
@@ -22,92 +28,12 @@ component IconButton inherits Rectangle {
         }
     }
 
-    // En un layout, `alignment` alinea en el eje principal y
-    // `cross-axis-alignment` en el transversal: hacen falta los dos para centrar.
-    if kind == 0: HorizontalLayout {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
-        spacing: 1px;
-        alignment: center;
-        cross-axis-alignment: center;
-
-        Text {
-            text: "◀";
-            color: #f2f2f6;
-            font-size: 11px;
-        }
-
-        Text {
-            text: "10";
-            color: #f2f2f6;
-            font-size: 11px;
-        }
-    }
-
-    if kind == 1: Text {
-        text: "▶";
-        color: #f2f2f6;
-        font-size: 15px;
-        width: root.width;
-        height: root.height;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-
-    if kind == 2: HorizontalLayout {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
-        spacing: 4px;
-        alignment: center;
-        cross-axis-alignment: center;
-
-        Rectangle {
-            width: 4px;
-            height: 14px;
-            border-radius: 1px;
-            background: #f2f2f6;
-        }
-
-        Rectangle {
-            width: 4px;
-            height: 14px;
-            border-radius: 1px;
-            background: #f2f2f6;
-        }
-    }
-
-    if kind == 3: HorizontalLayout {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
-        spacing: 1px;
-        alignment: center;
-        cross-axis-alignment: center;
-
-        Text {
-            text: "10";
-            color: #f2f2f6;
-            font-size: 11px;
-        }
-
-        Text {
-            text: "▶";
-            color: #f2f2f6;
-            font-size: 11px;
-        }
-    }
-
-    if kind == 4: Text {
-        text: "×";
-        color: #e2e2ea;
-        font-size: 19px;
-        width: root.width;
-        height: root.height;
+    Image {
+        source: root.icon;
+        colorize: root.tint;
+        image-fit: contain;
+        width: root.icon-size;
+        height: root.icon-size;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -184,25 +110,27 @@ export component AppWindow inherits Window {
                 spacing: 4px;
 
                 IconButton {
-                    kind: 0;
+                    icon: @image-url("../assets/icons/replay_10.svg");
                     active: root.has-session && root.can-seek;
                     clicked => { root.seek-backward(); }
                 }
 
                 IconButton {
-                    kind: root.playing ? 2 : 1;
+                    icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
                     active: root.has-session && root.can-toggle;
                     clicked => { root.toggle-play-pause(); }
                 }
 
                 IconButton {
-                    kind: 3;
+                    icon: @image-url("../assets/icons/forward_10.svg");
                     active: root.has-session && root.can-seek;
                     clicked => { root.seek-forward(); }
                 }
 
                 IconButton {
-                    kind: 4;
+                    icon: @image-url("../assets/icons/close.svg");
+                    icon-size: 15px;
+                    tint: #e2e2ea;
                     clicked => { root.quit(); }
                 }
             }

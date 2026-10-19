@@ -16,17 +16,13 @@ pub enum Command {
 
 /// Estado de reproducción tal y como lo reporta el sistema.
 ///
-/// Algunas variantes solo las produce el backend real de Windows; el shim de
-/// desarrollo nunca las construye.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Es agnóstico de plataforma: los estados que son propios de un sistema (el
+/// ciclo de vida de una sesión WinRT, por ejemplo) se traducen en su adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackState {
-    Closed,
-    Opened,
-    Changing,
-    Stopped,
     Playing,
     Paused,
+    Stopped,
     Unknown,
 }
 
@@ -41,14 +37,17 @@ pub struct Snapshot {
     pub state: PlaybackState,
     pub can_toggle: bool,
     pub can_seek: bool,
-    /// Posición y duración en ticks de 100 ns (unidad de `WinRT`).
+    /// Posición y duración en ticks de 100 ns.
+    ///
+    /// Es la unidad del contrato: los adapters convierten a la suya (Windows
+    /// ya usa ticks de 100 ns; MPRIS usa microsegundos).
     pub position_ticks: i64,
     pub duration_ticks: i64,
 }
 
 impl Snapshot {
-    /// Estado cuando no hay ninguna sesión multimedia (lo usa el backend de Windows).
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Estado cuando no hay ninguna sesión multimedia.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub fn no_session() -> Self {
         Self {
             has_session: false,
@@ -66,5 +65,5 @@ impl Snapshot {
 }
 
 /// Callback con el que el backend publica cada cambio. Es `Send + Sync` porque
-/// lo comparte el hilo de medios y los manejadores de eventos de `WinRT`.
+/// lo comparten el hilo de medios y los manejadores de eventos del sistema.
 pub type Sink = Arc<dyn Fn(Snapshot) + Send + Sync + 'static>;

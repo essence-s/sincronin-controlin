@@ -304,9 +304,10 @@ fn read_controls(
         Ok(PlaybackStatus::Playing) => PlaybackState::Playing,
         Ok(PlaybackStatus::Paused) => PlaybackState::Paused,
         Ok(PlaybackStatus::Stopped) => PlaybackState::Stopped,
-        Ok(PlaybackStatus::Closed) => PlaybackState::Closed,
-        Ok(PlaybackStatus::Opened) => PlaybackState::Opened,
-        Ok(PlaybackStatus::Changing) => PlaybackState::Changing,
+        // `Closed` y `Opened` son estados del ciclo de vida de una sesión
+        // WinRT, no del reproductor: para el usuario no hay nada sonando.
+        Ok(PlaybackStatus::Closed) | Ok(PlaybackStatus::Opened) => PlaybackState::Stopped,
+        Ok(PlaybackStatus::Changing) => PlaybackState::Unknown,
         // GSMTC puede ampliar los estados en el futuro; cualquier otro se trata como desconocido.
         Ok(_) | Err(_) => PlaybackState::Unknown,
     };

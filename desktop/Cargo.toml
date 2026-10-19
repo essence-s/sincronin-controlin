@@ -23,6 +23,10 @@ windows = { version = "0.62.2", features = [
 ] }
 raw-window-handle = "0.6"
 
+# MPRIS: el estándar de Linux para controlar reproductores (D-Bus).
+[target.'cfg(target_os = "linux")'.dependencies]
+mpris = "2"
+
 [build-dependencies]
 slint-build = "1.18.1"
 

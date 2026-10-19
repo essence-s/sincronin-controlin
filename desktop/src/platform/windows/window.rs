@@ -59,7 +59,7 @@ fn attempt(weak: slint::Weak<AppWindow>, attempt_n: u32) {
             attempt(weak, attempt_n + 1);
         });
     } else {
-        eprintln!("[ventana] no se pudo obtener el HWND; se deja el style normal");
+        eprintln!("[ventana] no se pudo obtener el HWND; se deja el estilo normal");
     }
 }
 

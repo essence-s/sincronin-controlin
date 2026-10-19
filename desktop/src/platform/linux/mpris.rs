@@ -23,27 +23,27 @@ use crate::media::{Command, PlaybackState, Sink, Snapshot};
 ///
 /// También es la latencia máxima de un clic en los botones, porque el hilo
 /// espera acá: el click se atiende justo después del próximo tick.
-const INTERVALO_MS: u32 = 100;
+const INTERVAL_MS: u32 = 100;
 
 /// Cuánto se avanza o retrocede con los botones, en microsegundos.
-const SALTO_SEEK_US: i64 = 10_000_000;
+const SEEK_STEP_US: i64 = 10_000_000;
 
 /// Qué se espera cuando no hay ningún reproductor en el bus antes de
 /// volver a buscar uno.
-const REINTENTO_SIN_REPRODUCTOR: Duration = Duration::from_secs(2);
+const RETRY_WITHOUT_PLAYER: Duration = Duration::from_secs(2);
 
 /// Errores del backend.
 #[derive(Debug)]
 enum Error {
     Bus(mpris::DBusError),
-    Busca(mpris::FindingError),
+    Find(mpris::FindingError),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bus(err) => write!(f, "error de D-Bus: {err}"),
-            Self::Busca(err) => write!(f, "no se encontró un reproductor: {err}"),
+            Self::Find(err) => write!(f, "no se encontró un reproductor: {err}"),
         }
     }
 }
@@ -58,7 +58,7 @@ impl From<mpris::DBusError> for Error {
 
 impl From<mpris::FindingError> for Error {
     fn from(err: mpris::FindingError) -> Self {
-        Self::Busca(err)
+        Self::Find(err)
     }
 }
 
@@ -66,33 +66,33 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
     std::thread::Builder::new()
         .name("mpris".to_string())
         .spawn(move || {
-            if let Err(err) = ejecutar(cmd_rx, sink) {
+            if let Err(err) = run(cmd_rx, sink) {
                 eprintln!("[media] el backend MPRIS se detuvo: {err}");
             }
         })
         .expect("no se pudo crear el hilo de medios");
 }
 
-fn ejecutar(cmd_rx: Receiver<Command>, sink: Sink) -> Result<(), Error> {
+fn run(cmd_rx: Receiver<Command>, sink: Sink) -> Result<(), Error> {
     let finder = PlayerFinder::new()?;
-    let mut player = elegir(&finder, None);
-    let mut ultimo = String::new();
+    let mut player = pick(&finder, None);
+    let mut last = String::new();
 
     loop {
         match player.as_ref() {
             Some(p) => {
-                ultimo.clear();
-                ultimo.push_str(p.identity());
-                if atender(p, &cmd_rx, &sink)? {
+                last.clear();
+                last.push_str(p.identity());
+                if handle(p, &cmd_rx, &sink)? {
                     // El reproductor terminó: buscar otro desde cero.
-                    player = elegir(&finder, Some(&ultimo));
+                    player = pick(&finder, Some(&last));
                 }
             }
             None => {
                 // No hay ningún reproductor: avisar y reintentar más tarde.
                 sink(Snapshot::no_session());
-                std::thread::sleep(REINTENTO_SIN_REPRODUCTOR);
-                player = elegir(&finder, Some(&ultimo));
+                std::thread::sleep(RETRY_WITHOUT_PLAYER);
+                player = pick(&finder, Some(&last));
             }
         }
     }
@@ -101,8 +101,8 @@ fn ejecutar(cmd_rx: Receiver<Command>, sink: Sink) -> Result<(), Error> {
 /// Atiende el reproductor actual hasta que termina.
 ///
 /// Devuelve `true` si hay que buscar otro reproductor.
-fn atender(player: &Player, cmd_rx: &Receiver<Command>, sink: &Sink) -> Result<bool, Error> {
-    let mut tracker = player.track_progress(INTERVALO_MS)?;
+fn handle(player: &Player, cmd_rx: &Receiver<Command>, sink: &Sink) -> Result<bool, Error> {
+    let mut tracker = player.track_progress(INTERVAL_MS)?;
     eprintln!("[media] reproductor MPRIS: {}", player.identity());
 
     loop {
@@ -113,7 +113,7 @@ fn atender(player: &Player, cmd_rx: &Receiver<Command>, sink: &Sink) -> Result<b
         // Los comandos de la UI se atienden sin bloquear: `tick()` ya
         // esperó el intervalo.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            ejecutar_comando(cmd, player);
+            execute_command(cmd, player);
         }
 
         if tick.player_quit {
@@ -128,49 +128,49 @@ fn atender(player: &Player, cmd_rx: &Receiver<Command>, sink: &Sink) -> Result<b
 ///
 /// Se prefiere el que está sonando. Si hay varios pausados, el último que se
 /// vio: es el que el usuario está mirando.
-fn elegir(finder: &PlayerFinder, ultimo: Option<&str>) -> Option<Player> {
-    let todos = match finder.find_all() {
-        Ok(todos) => todos,
+fn pick(finder: &PlayerFinder, last: Option<&str>) -> Option<Player> {
+    let all = match finder.find_all() {
+        Ok(all) => all,
         Err(err) => {
             eprintln!("[media] no se pudieron listar los reproductores: {err}");
             return None;
         }
     };
-    if todos.is_empty() {
+    if all.is_empty() {
         return None;
     }
 
     // 1. El que está sonando.
-    let sonando = todos
+    let playing = all
         .iter()
         .find(|p| matches!(p.get_playback_status(), Ok(PlaybackStatus::Playing)))
         .map(|p| p.bus_name().to_string());
-    if let Some(nombre) = sonando {
-        return todos.into_iter().find(|p| p.bus_name() == nombre);
+    if let Some(name) = playing {
+        return all.into_iter().find(|p| p.bus_name() == name);
     }
 
     // 2. El último que se vio, si sigue en la lista.
-    if let Some(identidad) = ultimo {
-        let visto = todos
+    if let Some(identidad) = last {
+        let seen = all
             .iter()
             .find(|p| p.identity() == identidad)
             .map(|p| p.bus_name().to_string());
-        if let Some(nombre) = visto {
-            return todos.into_iter().find(|p| p.bus_name() == nombre);
+        if let Some(name) = seen {
+            return all.into_iter().find(|p| p.bus_name() == name);
         }
     }
 
     // 3. El primero que exista.
-    todos.into_iter().next()
+    all.into_iter().next()
 }
 
-fn ejecutar_comando(cmd: Command, player: &Player) {
-    let resultado = match cmd {
+fn execute_command(cmd: Command, player: &Player) {
+    let result = match cmd {
         Command::TogglePlayPause => player.play_pause(),
-        Command::SeekBackward => player.seek(-SALTO_SEEK_US),
-        Command::SeekForward => player.seek(SALTO_SEEK_US),
+        Command::SeekBackward => player.seek(-SEEK_STEP_US),
+        Command::SeekForward => player.seek(SEEK_STEP_US),
     };
-    if let Err(err) = resultado {
+    if let Err(err) = result {
         eprintln!("[media] el comando {cmd:?} falló: {err}");
     }
 }
@@ -184,18 +184,18 @@ fn snapshot(progress: &Progress, player: &Player) -> Snapshot {
         artist: metadata.artists().unwrap_or_default().join(", "),
         album: metadata.album_name().unwrap_or_default().to_string(),
         source_app: player.identity().to_string(),
-        state: estado(progress.playback_status()),
+        state: state(progress.playback_status()),
         // Si la consulta falla, el reproductor probablemente ya no esté: es
         // más honesto no ofrecer la acción que ofrecerla rota.
         can_toggle: player.can_play().unwrap_or(false) && player.can_pause().unwrap_or(false),
         can_seek: player.can_seek().unwrap_or(false),
-        position_ticks: a_ticks(progress.position()),
-        duration_ticks: progress.length().map(a_ticks).unwrap_or(0),
+        position_ticks: to_ticks(progress.position()),
+        duration_ticks: progress.length().map(to_ticks).unwrap_or(0),
     }
 }
 
 /// Traduce el estado de MPRIS al del contrato.
-fn estado(status: PlaybackStatus) -> PlaybackState {
+fn state(status: PlaybackStatus) -> PlaybackState {
     match status {
         PlaybackStatus::Playing => PlaybackState::Playing,
         PlaybackStatus::Paused => PlaybackState::Paused,
@@ -208,8 +208,8 @@ fn estado(status: PlaybackStatus) -> PlaybackState {
 ///
 /// MPRIS trabaja en microsegundos y Windows en ticks de 100 ns, así que la
 /// conversión es ×10.
-fn a_ticks(duracion: Duration) -> i64 {
-    let ticks = duracion.as_micros().saturating_mul(10);
+fn to_ticks(duration: Duration) -> i64 {
+    let ticks = duration.as_micros().saturating_mul(10);
     i64::try_from(ticks).unwrap_or(i64::MAX)
 }
 
@@ -218,22 +218,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn convierte_microsegundos_a_ticks() {
+    fn converts_microseconds_to_ticks() {
         // MPRIS: 1.400.000 µs = 1,4 s. Ticks de 100 ns: 14.000.000.
-        assert_eq!(a_ticks(Duration::from_micros(1_400_000)), 14_000_000);
-        assert_eq!(a_ticks(Duration::from_secs(10)), 100_000_000);
-        assert_eq!(a_ticks(Duration::ZERO), 0);
+        assert_eq!(to_ticks(Duration::from_micros(1_400_000)), 14_000_000);
+        assert_eq!(to_ticks(Duration::from_secs(10)), 100_000_000);
+        assert_eq!(to_ticks(Duration::ZERO), 0);
     }
 
     #[test]
-    fn no_desborda_con_duraciones_absurdas() {
-        assert_eq!(a_ticks(Duration::MAX), i64::MAX);
+    fn does_not_overflow_with_absurd_durations() {
+        assert_eq!(to_ticks(Duration::MAX), i64::MAX);
     }
 
     #[test]
-    fn traduce_los_estados() {
-        assert_eq!(estado(PlaybackStatus::Playing), PlaybackState::Playing);
-        assert_eq!(estado(PlaybackStatus::Paused), PlaybackState::Paused);
-        assert_eq!(estado(PlaybackStatus::Stopped), PlaybackState::Stopped);
+    fn translates_the_states() {
+        assert_eq!(state(PlaybackStatus::Playing), PlaybackState::Playing);
+        assert_eq!(state(PlaybackStatus::Paused), PlaybackState::Paused);
+        assert_eq!(state(PlaybackStatus::Stopped), PlaybackState::Stopped);
     }
 }

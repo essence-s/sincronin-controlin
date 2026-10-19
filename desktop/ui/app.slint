@@ -1,0 +1,235 @@
+// Botón con iconos hechos con texto y rectángulos.
+// Se evitan los elementos `Path` a propósito: el renderizador software (el que
+// se usa cuando no hay aceleración gráfica) no los pinta, y así la barra se ve
+// igual con cualquier renderizador y en cualquier equipo.
+component IconButton inherits Rectangle {
+    // 0 = -10s, 1 = play, 2 = pausa, 3 = +10s, 4 = cerrar
+    in property <int> kind: 1;
+    in property <bool> active: true;
+    callback clicked();
+
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: touch.pressed ? #55555b : (touch.has-hover ? #2d2d2f : #353539);
+    opacity: root.active ? 1 : 0.35;
+
+    touch := TouchArea {
+        clicked => {
+            if root.active {
+                root.clicked();
+            }
+        }
+    }
+
+    // En un layout, `alignment` alinea en el eje principal y
+    // `cross-axis-alignment` en el transversal: hacen falta los dos para centrar.
+    if kind == 0: HorizontalLayout {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        spacing: 1px;
+        alignment: center;
+        cross-axis-alignment: center;
+
+        Text {
+            text: "◀";
+            color: #f2f2f6;
+            font-size: 11px;
+        }
+
+        Text {
+            text: "10";
+            color: #f2f2f6;
+            font-size: 11px;
+        }
+    }
+
+    if kind == 1: Text {
+        text: "▶";
+        color: #f2f2f6;
+        font-size: 15px;
+        width: root.width;
+        height: root.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if kind == 2: HorizontalLayout {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        spacing: 4px;
+        alignment: center;
+        cross-axis-alignment: center;
+
+        Rectangle {
+            width: 4px;
+            height: 14px;
+            border-radius: 1px;
+            background: #f2f2f6;
+        }
+
+        Rectangle {
+            width: 4px;
+            height: 14px;
+            border-radius: 1px;
+            background: #f2f2f6;
+        }
+    }
+
+    if kind == 3: HorizontalLayout {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        spacing: 1px;
+        alignment: center;
+        cross-axis-alignment: center;
+
+        Text {
+            text: "10";
+            color: #f2f2f6;
+            font-size: 11px;
+        }
+
+        Text {
+            text: "▶";
+            color: #f2f2f6;
+            font-size: 11px;
+        }
+    }
+
+    if kind == 4: Text {
+        text: "×";
+        color: #e2e2ea;
+        font-size: 19px;
+        width: root.width;
+        height: root.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "sincronin-controlin";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    preferred-width: 420px;
+    preferred-height: 72px;
+
+    in-out property <string> track-title: "Esperando al reproductor…";
+    in-out property <string> track-artist: "";
+    in-out property <bool> playing: false;
+    in-out property <bool> has-session: false;
+    in-out property <bool> can-toggle: true;
+    in-out property <bool> can-seek: true;
+    in-out property <int> position-secs: 0;
+    in-out property <int> duration-secs: 0;
+
+    callback toggle-play-pause();
+    callback seek-backward();
+    callback seek-forward();
+    callback quit();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 14px;
+        background: @linear-gradient(180deg, #202021, #0d0d0d);
+        border-width: 1px;
+        border-color: #ffffff18;
+
+        // Toda la barra se puede arrastrar. Los botones se declaran después, así
+        // que quedan por encima y siguen recibiendo sus clics con normalidad.
+        WindowMoveArea { }
+
+        // Contenido: texto flexible a la izquierda, botones con su tamaño a la derecha.
+        // `cross-axis-alignment: center` es lo que los centra verticalmente.
+        HorizontalLayout {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            padding-left: 18px;
+            padding-right: 14px;
+            spacing: 12px;
+            cross-axis-alignment: center;
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 1px;
+
+                Text {
+                    text: root.track-title;
+                    color: root.has-session ? #f4f4f8 : #8d8d99;
+                    font-size: 14px;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.track-artist;
+                    color: #9a9aa6;
+                    font-size: 11px;
+                    overflow: elide;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 4px;
+
+                IconButton {
+                    kind: 0;
+                    active: root.has-session && root.can-seek;
+                    clicked => { root.seek-backward(); }
+                }
+
+                IconButton {
+                    kind: root.playing ? 2 : 1;
+                    active: root.has-session && root.can-toggle;
+                    clicked => { root.toggle-play-pause(); }
+                }
+
+                IconButton {
+                    kind: 3;
+                    active: root.has-session && root.can-seek;
+                    clicked => { root.seek-forward(); }
+                }
+
+                IconButton {
+                    kind: 4;
+                    clicked => { root.quit(); }
+                }
+            }
+        }
+
+        // Línea de progreso: riel y relleno como hermanos, para que las
+        // posiciones sean inequívocas.
+        Rectangle {
+            x: 18px;
+            y: parent.height - 9px;
+            width: parent.width - 188px;
+            height: 3px;
+            border-radius: 1.5px;
+            background: #ffffff1c;
+        }
+
+        Rectangle {
+            x: 18px;
+            y: parent.height - 9px;
+            height: 3px;
+            border-radius: 1.5px;
+            background: #7c7cff;
+            width: root.duration-secs > 0
+                ? min(
+                    (root.position-secs * (parent.width - 188px)) / root.duration-secs,
+                    parent.width - 188px)
+                : 0px;
+        }
+    }
+}

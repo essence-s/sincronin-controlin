@@ -1,0 +1,4 @@
+fn main() {
+    println!("cargo:rerun-if-changed=ui/app.slint");
+    slint_build::compile("ui/app.slint").expect("no se pudo compilar ui/app.slint");
+}

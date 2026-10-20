@@ -12,12 +12,33 @@
 //! `Rc`, así que no se puede mandar a otro hilo, y el socket de `dbus` no
 //! admite dos lectores.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
+use dbus::message::MatchRule;
 use mpris::{PlaybackStatus, Player, PlayerFinder, Progress};
 
-use crate::media::{Command, PlaybackState, Sink, Snapshot};
+use crate::media::{Command, PlaybackState, Session, Sink, Snapshot};
+
+/// Los argumentos de la señal `NameOwnerChanged` del bus: el nombre del
+/// recurso, su dueño anterior y el nuevo.
+struct NameOwnerChanged {
+    name: String,
+    old_owner: String,
+    new_owner: String,
+}
+
+impl dbus::arg::ReadAll for NameOwnerChanged {
+    fn read(i: &mut dbus::arg::Iter<'_>) -> Result<Self, dbus::arg::TypeMismatchError> {
+        Ok(Self {
+            name: i.read()?,
+            old_owner: i.read()?,
+            new_owner: i.read()?,
+        })
+    }
+}
 
 /// Cada cuánto se refresca la posición interpolada.
 ///
@@ -28,6 +49,12 @@ const INTERVAL_MS: u32 = 100;
 /// Cuánto se avanza o retrocede con los botones, en microsegundos.
 const SEEK_STEP_US: i64 = 10_000_000;
 
+/// Los nombres de bus de los proxies conocidos.
+///
+/// Un proxy refleja el reproductor de otro proceso: no es una sesión propia,
+/// sino una copia de otra. `playerctld` es el caso habitual.
+const PROXY_NAMES: &[&str] = &["playerctld"];
+
 /// Qué se espera cuando no hay ningún reproductor en el bus antes de
 /// volver a buscar uno.
 const RETRY_WITHOUT_PLAYER: Duration = Duration::from_secs(2);
@@ -37,6 +64,7 @@ const RETRY_WITHOUT_PLAYER: Duration = Duration::from_secs(2);
 enum Error {
     Bus(mpris::DBusError),
     Find(mpris::FindingError),
+    Dbus(dbus::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -44,6 +72,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Bus(err) => write!(f, "error de D-Bus: {err}"),
             Self::Find(err) => write!(f, "no se encontró un reproductor: {err}"),
+            Self::Dbus(err) => write!(f, "error del bus: {err}"),
         }
     }
 }
@@ -62,6 +91,31 @@ impl From<mpris::FindingError> for Error {
     }
 }
 
+impl From<dbus::Error> for Error {
+    fn from(err: dbus::Error) -> Self {
+        Self::Dbus(err)
+    }
+}
+
+/// Qué tiene que hacer el bucle después de atender al reproductor.
+enum Outcome {
+    /// Seguir con el mismo reproductor.
+    Keep,
+    /// El reproductor terminó: buscar otro.
+    Gone,
+    /// El usuario eligió otra sesión.
+    Switch(String),
+}
+
+/// El estado que el bucle comparte entre iteraciones.
+struct State {
+    finder: PlayerFinder,
+    /// Las sesiones disponibles.
+    sessions: Vec<Session>,
+    /// El bus avisó que cambió el conjunto de reproductores.
+    dirty: Arc<AtomicBool>,
+}
+
 pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
     std::thread::Builder::new()
         .name("mpris".to_string())
@@ -75,35 +129,104 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
 
 fn run(cmd_rx: Receiver<Command>, sink: Sink) -> Result<(), Error> {
     let finder = PlayerFinder::new()?;
-    let mut player = pick(&finder, None);
-    let mut last = String::new();
+
+    // El conjunto de reproductores cambia cuando alguien entra o sale del
+    // bus. `NameOwnerChanged` lo avisa; `find_all()` es caro (una
+    // introspección por reproductor), así que no se consulta en cada tick.
+    let mut state = State {
+        finder,
+        sessions: Vec::new(),
+        dirty: Arc::new(AtomicBool::new(true)),
+    };
+    watch_bus(state.dirty.clone());
+
+    let mut current = pick(&mut state, None, None);
+    let mut last: Option<String> = None;
 
     loop {
-        match player.as_ref() {
-            Some(p) => {
-                last.clear();
-                last.push_str(p.identity());
-                if handle(p, &cmd_rx, &sink)? {
-                    // El reproductor terminó: buscar otro desde cero.
-                    player = pick(&finder, Some(&last));
-                }
+        let Some(player) = current.as_ref() else {
+            // No hay ningún reproductor: avisar y reintentar más tarde.
+            sink(Snapshot::no_session());
+            std::thread::sleep(RETRY_WITHOUT_PLAYER);
+            current = pick(&mut state, last.as_deref(), None);
+            continue;
+        };
+
+        last = Some(player.bus_name().to_string());
+        match handle(player, &cmd_rx, &sink, &mut state)? {
+            Outcome::Keep => {}
+            Outcome::Gone => {
+                eprintln!("[media] el reproductor se fue: {}", player.bus_name());
+                // Se busca otro del mismo programa, pero no el que se acaba
+                // de ir: si vuelve a aparecer en el bus, el bucle se
+                // engancharía con él.
+                current = pick(&mut state, Some(player.identity()), Some(player.bus_name()));
             }
-            None => {
-                // No hay ningún reproductor: avisar y reintentar más tarde.
-                sink(Snapshot::no_session());
-                std::thread::sleep(RETRY_WITHOUT_PLAYER);
-                player = pick(&finder, Some(&last));
+            Outcome::Switch(id) => {
+                eprintln!("[media] se elige otra sesión: {id}");
+                current = pick(&mut state, Some(&id), None);
             }
         }
     }
 }
 
-/// Atiende el reproductor actual hasta que termina.
+/// Mira el bus para saber cuándo cambia el conjunto de reproductores.
 ///
-/// Devuelve `true` si hay que buscar otro reproductor.
-fn handle(player: &Player, cmd_rx: &Receiver<Command>, sink: &Sink) -> Result<bool, Error> {
+/// Va en su propio hilo con su propia conexión: la del backend la usa el
+/// crate `mpris` para hablar con los reproductores.
+fn watch_bus(dirty: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new()
+        .name("mpris-watch".to_string())
+        .spawn(move || {
+            let conn = match dbus::blocking::Connection::new_session() {
+                Ok(conn) => conn,
+                Err(err) => {
+                    eprintln!("[media] no se pudo mirar el bus: {err}");
+                    return;
+                }
+            };
+            let rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+            if conn
+                .add_match::<NameOwnerChanged, _>(rule, move |signal, _conn, _msg| {
+                    // Solo los reproductores MPRIS nos interesan: el bus de
+                    // sesión cambia por un montón de cosas más.
+                    if !signal.name.starts_with("org.mpris.MediaPlayer2") {
+                        return true;
+                    }
+                    eprintln!(
+                        "[media] cambió el reproductor {} ({} → {})",
+                        signal.name, signal.old_owner, signal.new_owner
+                    );
+                    dirty.store(true, Ordering::Relaxed);
+                    true
+                })
+                .is_err()
+            {
+                return;
+            }
+            // Atiende el bus para siempre: la señal llega por acá.
+            loop {
+                if let Err(err) = conn.process(Duration::from_millis(500)) {
+                    eprintln!("[media] se cortó la escucha del bus: {err}");
+                    return;
+                }
+            }
+        });
+}
+
+/// Atiende el reproductor actual hasta que termina.
+fn handle(
+    player: &Player,
+    cmd_rx: &Receiver<Command>,
+    sink: &Sink,
+    state: &mut State,
+) -> Result<Outcome, Error> {
     let mut tracker = player.track_progress(INTERVAL_MS)?;
-    eprintln!("[media] reproductor MPRIS: {}", player.identity());
+    eprintln!(
+        "[media] reproductor MPRIS: {} ({})",
+        player.identity(),
+        player.bus_name()
+    );
 
     loop {
         // Espera la señal de D-Bus o el fin del intervalo, lo que pase
@@ -112,70 +235,168 @@ fn handle(player: &Player, cmd_rx: &Receiver<Command>, sink: &Sink) -> Result<bo
 
         // Los comandos de la UI se atienden sin bloquear: `tick()` ya
         // esperó el intervalo.
+        let mut outcome = Outcome::Keep;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            execute_command(cmd, player);
+            match cmd {
+                Command::TogglePlayPause => {
+                    if let Err(err) = player.play_pause() {
+                        eprintln!("[media] play/pausa falló: {err}");
+                    }
+                }
+                Command::SeekBackward => {
+                    if let Err(err) = player.seek(-SEEK_STEP_US) {
+                        eprintln!("[media] retroceder falló: {err}");
+                    }
+                }
+                Command::SeekForward => {
+                    if let Err(err) = player.seek(SEEK_STEP_US) {
+                        eprintln!("[media] avanzar falló: {err}");
+                    }
+                }
+                Command::SelectSession(id) => {
+                    outcome = Outcome::Switch(id);
+                    break;
+                }
+            }
         }
 
+        // El bus avisó que cambió el conjunto de reproductores: la lista de
+        // sesiones se relee, pero solo de una vez.
+        if state.dirty.swap(false, Ordering::Relaxed) {
+            refresh(state);
+        }
+
+        if matches!(outcome, Outcome::Switch(_)) {
+            return Ok(outcome);
+        }
         if tick.player_quit {
-            return Ok(true);
+            return Ok(Outcome::Gone);
         }
 
-        sink(snapshot(tick.progress, player));
+        sink(snapshot(tick.progress, player, &state.sessions));
     }
 }
 
 /// Elige con qué reproductor trabajar.
 ///
-/// Se prefiere el que está sonando. Si hay varios pausados, el último que se
-/// vio: es el que el usuario está mirando.
-fn pick(finder: &PlayerFinder, last: Option<&str>) -> Option<Player> {
-    let all = match finder.find_all() {
-        Ok(all) => all,
-        Err(err) => {
-            eprintln!("[media] no se pudieron listar los reproductores: {err}");
-            return None;
-        }
-    };
+/// `preferred` es lo que se busca primero: el `id` de la sesión que eligió el
+/// usuario, o —si el reproductor se fue— el nombre del programa, para seguir
+/// con la misma aplicación aunque sea otra instancia.
+///
+/// `exclude` es el reproductor que acaba de irse: no se vuelve a elegir, o el
+/// bucle se engancharía con él.
+///
+/// Si no hay ninguno de los dos, se prefiere el que está sonando; si hay
+/// varios pausados, el último que se vio: es el que el usuario está mirando.
+fn pick(state: &mut State, preferred: Option<&str>, exclude: Option<&str>) -> Option<Player> {
+    let all: Vec<Player> = refresh(state)
+        .into_iter()
+        .filter(|p| Some(p.bus_name()) != exclude)
+        .collect();
     if all.is_empty() {
         return None;
     }
 
-    // 1. El que está sonando.
-    let playing = all
-        .iter()
-        .find(|p| matches!(p.get_playback_status(), Ok(PlaybackStatus::Playing)))
-        .map(|p| p.bus_name().to_string());
-    if let Some(name) = playing {
-        return all.into_iter().find(|p| p.bus_name() == name);
-    }
+    // 1. El preferido, si sigue en la lista.
+    let chosen = preferred
+        .and_then(|want| all.iter().position(|p| p.bus_name() == want))
+        // 2. El mismo programa, si es otro el que se fue.
+        .or_else(|| preferred.and_then(|want| all.iter().position(|p| p.identity() == want)))
+        // 3. El que está sonando.
+        .or_else(|| {
+            all.iter()
+                .position(|p| matches!(p.get_playback_status(), Ok(PlaybackStatus::Playing)))
+        })
+        // 4. El primero que exista.
+        .unwrap_or(0);
 
-    // 2. El último que se vio, si sigue en la lista.
-    if let Some(identidad) = last {
-        let seen = all
-            .iter()
-            .find(|p| p.identity() == identidad)
-            .map(|p| p.bus_name().to_string());
-        if let Some(name) = seen {
-            return all.into_iter().find(|p| p.bus_name() == name);
+    all.into_iter().nth(chosen)
+}
+
+/// Relee el bus y deja la lista de sesiones al día.
+///
+/// Devuelve los reproductores que hay, sin los proxies.
+fn refresh(state: &mut State) -> Vec<Player> {
+    match state.finder.find_all() {
+        Ok(all) => {
+            let players = without_proxies(all);
+            state.sessions = build_sessions(&players);
+            players
+        }
+        Err(err) => {
+            eprintln!("[media] no se pudieron listar los reproductores: {err}");
+            Vec::new()
         }
     }
-
-    // 3. El primero que exista.
-    all.into_iter().next()
 }
 
-fn execute_command(cmd: Command, player: &Player) {
-    let result = match cmd {
-        Command::TogglePlayPause => player.play_pause(),
-        Command::SeekBackward => player.seek(-SEEK_STEP_US),
-        Command::SeekForward => player.seek(SEEK_STEP_US),
-    };
-    if let Err(err) = result {
-        eprintln!("[media] el comando {cmd:?} falló: {err}");
+/// Quita los proxies: nombres de bus que reflejan el reproductor de otro.
+///
+/// `playerctld` se anuncia con su propio nombre de bus pero con la identidad
+/// del reproductor que refleja. Si no se filtra, el mismo reproductor
+/// aparece dos veces en el selector.
+fn without_proxies(all: Vec<Player>) -> Vec<Player> {
+    all.into_iter()
+        .filter(|p| !is_proxy(p.bus_name()))
+        .collect()
+}
+
+/// Si el nombre de bus corresponde a un proxy conocido.
+fn is_proxy(bus_name: &str) -> bool {
+    let tail = bus_name.rsplit('.').next().unwrap_or(bus_name);
+    PROXY_NAMES.iter().any(|p| tail.eq_ignore_ascii_case(p))
+}
+
+/// Arma la lista de sesiones a partir de los reproductores del bus.
+///
+/// Cada reproductor es una sesión: dos ventanas del mismo navegador o dos
+/// instancias de mpv son sesiones distintas, aunque compartan nombre. Por eso
+/// la clave es el nombre de bus y no la identidad.
+///
+/// Cuando varias sesiones comparten nombre se numeran, para que el usuario
+/// pueda distinguirlas.
+fn build_sessions(players: &[Player]) -> Vec<Session> {
+    let raw: Vec<(String, String)> = players
+        .iter()
+        .map(|p| (p.bus_name().to_string(), p.identity().to_string()))
+        .collect();
+    sessions_from(&raw)
+}
+
+/// Como [`build_sessions`], pero sobre datos planos: así se puede probar sin
+/// un bus.
+fn sessions_from(raw: &[(String, String)]) -> Vec<Session> {
+    let mut sessions: Vec<Session> = raw
+        .iter()
+        .map(|(id, label)| Session {
+            id: id.clone(),
+            label: label.clone(),
+        })
+        .collect();
+
+    // Orden estable: por etiqueta y después por id. Así los números de las
+    // sesiones repetidas no cambian entre una foto y otra.
+    sessions.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+
+    // Numerar las que comparten etiqueta.
+    let mut i = 0;
+    while i < sessions.len() {
+        let mut j = i + 1;
+        while j < sessions.len() && sessions[j].label == sessions[i].label {
+            j += 1;
+        }
+        if j - i > 1 {
+            for (k, s) in sessions.iter_mut().enumerate().take(j).skip(i) {
+                s.label = format!("{} ({})", s.label, k - i + 1);
+            }
+        }
+        i = j;
     }
+
+    sessions
 }
 
-fn snapshot(progress: &Progress, player: &Player) -> Snapshot {
+fn snapshot(progress: &Progress, player: &Player, sessions: &[Session]) -> Snapshot {
     let metadata = progress.metadata();
 
     Snapshot {
@@ -191,6 +412,8 @@ fn snapshot(progress: &Progress, player: &Player) -> Snapshot {
         can_seek: player.can_seek().unwrap_or(false),
         position_ticks: to_ticks(progress.position()),
         duration_ticks: progress.length().map(to_ticks).unwrap_or(0),
+        sessions: sessions.to_vec(),
+        session_id: player.bus_name().to_string(),
     }
 }
 
@@ -235,5 +458,77 @@ mod tests {
         assert_eq!(state(PlaybackStatus::Playing), PlaybackState::Playing);
         assert_eq!(state(PlaybackStatus::Paused), PlaybackState::Paused);
         assert_eq!(state(PlaybackStatus::Stopped), PlaybackState::Stopped);
+    }
+
+    #[test]
+    fn recognizes_the_known_proxies() {
+        assert!(is_proxy("org.mpris.MediaPlayer2.playerctld"));
+        assert!(is_proxy("org.mpris.MediaPlayer2.PLAYERCTLD"));
+        assert!(!is_proxy("org.mpris.MediaPlayer2.mpv.instance-sLbacCqj"));
+        assert!(!is_proxy("org.mpris.MediaPlayer2.firefox.instance_1_40"));
+        // El nombre del proxy puede ser el prefijo de otro, pero no su cola.
+        assert!(!is_proxy("org.mpris.MediaPlayer2.playerctld.helper"));
+    }
+
+    #[test]
+    fn keeps_players_with_the_same_name_apart() {
+        // Dos ventanas del mismo navegador: mismo nombre, sesiones distintas.
+        let sesiones = sessions_from(&[
+            (
+                "org.mpris.MediaPlayer2.firefox.instance_1_40".to_string(),
+                "Mozilla zen".to_string(),
+            ),
+            (
+                "org.mpris.MediaPlayer2.firefox.instance_2_41".to_string(),
+                "Mozilla zen".to_string(),
+            ),
+        ]);
+
+        assert_eq!(sesiones.len(), 2);
+        assert_eq!(
+            sesiones[0].id,
+            "org.mpris.MediaPlayer2.firefox.instance_1_40"
+        );
+        assert_eq!(sesiones[0].label, "Mozilla zen (1)");
+        assert_eq!(
+            sesiones[1].id,
+            "org.mpris.MediaPlayer2.firefox.instance_2_41"
+        );
+        assert_eq!(sesiones[1].label, "Mozilla zen (2)");
+    }
+
+    #[test]
+    fn leaves_unique_names_alone() {
+        let sesiones = sessions_from(&[
+            (
+                "org.mpris.MediaPlayer2.mpv.instance-sLbacCqj".to_string(),
+                "mpv".to_string(),
+            ),
+            (
+                "org.mpris.MediaPlayer2.firefox.instance_1_40".to_string(),
+                "Mozilla zen".to_string(),
+            ),
+        ]);
+
+        assert_eq!(sesiones[0].label, "Mozilla zen");
+        assert_eq!(sesiones[1].label, "mpv");
+    }
+
+    #[test]
+    fn the_order_does_not_depend_on_the_order_of_the_bus() {
+        let a = (
+            "org.mpris.MediaPlayer2.firefox.instance_2_41".to_string(),
+            "Mozilla zen".to_string(),
+        );
+        let b = (
+            "org.mpris.MediaPlayer2.firefox.instance_1_40".to_string(),
+            "Mozilla zen".to_string(),
+        );
+
+        let uno = sessions_from(&[a.clone(), b.clone()]);
+        let otro = sessions_from(&[b, a]);
+
+        assert_eq!(uno, otro);
+        assert_eq!(uno[0].id, "org.mpris.MediaPlayer2.firefox.instance_1_40");
     }
 }

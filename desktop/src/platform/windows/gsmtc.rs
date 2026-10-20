@@ -11,7 +11,7 @@
 //! - Los manejadores de eventos de `WinRT` solo envían un aviso por canal; el
 //!   trabajo (leer metadatos, pedir acciones) ocurre siempre en el hilo "gsmtc".
 
-use crate::media::{Command, PlaybackState, Sink, Snapshot};
+use crate::media::{Command, PlaybackState, Session, Sink, Snapshot};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -290,6 +290,13 @@ fn publish(sink: &Sink, watch: Option<&Watch>, cache: &mut PropsCache, props_sta
         can_seek,
         position_ticks,
         duration_ticks,
+        // En Windows hay una sola sesión multimedia: la del sistema. La UI
+        // no muestra el selector con una sola.
+        sessions: vec![Session {
+            id: cache.app.clone(),
+            label: cache.app.clone(),
+        }],
+        session_id: cache.app.clone(),
     });
 }
 
@@ -374,6 +381,11 @@ fn execute(cmd: Command, watch: Option<&Watch>) {
         }
         Command::SeekBackward => seek_by(session, -SEEK_STEP),
         Command::SeekForward => seek_by(session, SEEK_STEP),
+        // En Windows hay una sola sesión multimedia: la del sistema. Elegir
+        // otra no tiene a qué llevar.
+        Command::SelectSession(id) => {
+            eprintln!("[media] en Windows solo hay una sesión; se ignora {id}");
+        }
     }
 }
 

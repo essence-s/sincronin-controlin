@@ -39,13 +39,55 @@ component IconButton inherits Rectangle {
     }
 }
 
+// Una sesión de medios que se puede elegir.
+//
+// El `id` es con lo que el backend la reconoce (el nombre de bus de D-Bus en
+// Linux, el identificador de la aplicación en Windows). El `label` es lo que
+// se ve en el chip, y lleva un sufijo cuando hay varias sesiones con el mismo
+// nombre.
+export struct MediaSession {
+    id: string,
+    label: string,
+}
+
+// Chip de una sesión de medios: el nombre del reproductor, y un clic para
+// elegir a cuál controlar.
+component SessionChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    callback clicked();
+
+    height: 17px;
+    border-radius: 8px;
+    background: root.selected ? #ffffff20 : #ffffff0a;
+
+    // El chip se ajusta al texto. El `Text` va directo (no en un layout) para
+    // que su ancho sea el natural y no dependa del chip: si no, el ancho del
+    // chip y el de su contenido se cyclan.
+    txt := Text {
+        text: root.label;
+        color: root.selected ? #f4f4f8 : #7d7d89;
+        font-size: 11px;
+        x: 7px;
+        y: (root.height - txt.height) / 2;
+    }
+    width: txt.width + 14px;
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "sincronin-controlin";
     no-frame: true;
     always-on-top: true;
     background: transparent;
     preferred-width: 420px;
-    preferred-height: 72px;
+    // Alto con espacio para la fila de sesiones, la barra de progreso y los
+    // márgenes. La ventana es siempre de este alto: si creciera al aparecer
+    // un reproductor, el compositor la ancla abajo y se saldría de la pantalla.
+    preferred-height: 84px;
 
     in-out property <string> track-title: "Esperando al reproductor…";
     in-out property <string> track-artist: "";
@@ -56,9 +98,16 @@ export component AppWindow inherits Window {
     in-out property <int> position-secs: 0;
     in-out property <int> duration-secs: 0;
 
+    // Las sesiones de medios disponibles y cuál se está controlando. Con una
+    // sola (o ninguna), el selector no se muestra.
+    in property <[MediaSession]> sessions;
+    in property <int> session-count: 0;
+    in property <string> session-id: "";
+
     callback toggle-play-pause();
     callback seek-backward();
     callback seek-forward();
+    callback select-session(string);
     callback quit();
 
     Rectangle {
@@ -102,6 +151,18 @@ export component AppWindow inherits Window {
                     color: #9a9aa6;
                     font-size: 11px;
                     overflow: elide;
+                }
+
+                // Selector de sesión: solo aparece cuando hay más de una.
+                if root.session-count > 1: HorizontalLayout {
+                    horizontal-stretch: 0;
+                    spacing: 5px;
+
+                    for session in root.sessions: SessionChip {
+                        label: session.label;
+                        selected: session.id == root.session-id;
+                        clicked => { root.select-session(session.id); }
+                    }
                 }
             }
 

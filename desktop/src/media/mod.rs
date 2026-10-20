@@ -7,11 +7,27 @@
 use std::sync::Arc;
 
 /// Orden que envía la UI al backend.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Command {
     TogglePlayPause,
     SeekBackward,
     SeekForward,
+    /// Elegir qué sesión de medios controlar.
+    SelectSession(String),
+}
+
+/// Una sesión de medios que el usuario puede elegir.
+///
+/// El `id` es con lo que el backend reconoce la sesión: en Linux es el nombre
+/// de bus de D-Bus, en Windows el identificador de la aplicación. El `label`
+/// es lo que se ve en el selector, y lleva un sufijo cuando hay varias
+/// sesiones con el mismo nombre.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    /// Identificador de la sesión.
+    pub id: String,
+    /// Texto que se muestra en el selector.
+    pub label: String,
 }
 
 /// Estado de reproducción tal y como lo reporta el sistema.
@@ -43,6 +59,15 @@ pub struct Snapshot {
     /// ya usa ticks de 100 ns; MPRIS usa microsegundos).
     pub position_ticks: i64,
     pub duration_ticks: i64,
+    /// Las sesiones de medios disponibles, para que la UI pueda elegir a cuál
+    /// controlar.
+    ///
+    /// Con una sola (o ninguna), la UI no muestra el selector.
+    pub sessions: Vec<Session>,
+    /// El `id` de la sesión que se está controlando.
+    ///
+    /// Vacío cuando no hay ninguna.
+    pub session_id: String,
 }
 
 impl Snapshot {
@@ -60,6 +85,8 @@ impl Snapshot {
             can_seek: false,
             position_ticks: 0,
             duration_ticks: 0,
+            sessions: Vec::new(),
+            session_id: String::new(),
         }
     }
 }

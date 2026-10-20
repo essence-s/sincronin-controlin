@@ -3958,6 +3958,7 @@ name = "sincronin-controlin"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "dbus",
  "mpris",
  "raw-window-handle",
  "slint",

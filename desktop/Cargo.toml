@@ -24,8 +24,10 @@ windows = { version = "0.62.2", features = [
 raw-window-handle = "0.6"
 
 # MPRIS: el estándar de Linux para controlar reproductores (D-Bus).
+# `dbus` se usa directo para escuchar el aviso de que cambió el bus.
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris = "2"
+dbus = "0.9"
 
 [build-dependencies]
 slint-build = "1.18.1"

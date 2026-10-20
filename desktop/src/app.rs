@@ -8,11 +8,11 @@
 //! vive en [`media`] y la integración con el sistema en [`platform`].
 
 use crossbeam_channel::unbounded;
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
-use crate::AppWindow;
 use crate::media::{Command, PlaybackState, Sink, Snapshot};
 use crate::platform;
+use crate::{AppWindow, MediaSession};
 
 pub fn run() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
@@ -49,6 +49,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
         });
     }
     {
+        let tx = cmd_tx.clone();
+        ui.on_select_session(move |session: SharedString| {
+            let _ = tx.send(Command::SelectSession(session.to_string()));
+        });
+    }
+    {
         let weak = ui.as_weak();
         ui.on_quit(move || {
             if let Some(ui) = weak.upgrade() {
@@ -64,6 +70,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
 }
 
 /// Vuelca una fotografía del backend en las propiedades de la UI.
+///
+/// Se llama en el hilo de la UI, así que puede tocar el modelo de sesiones:
+/// los modelos de Slint usan `Rc` y no se pueden mandar a otro hilo.
 fn apply(ui: &AppWindow, snapshot: &Snapshot) {
     ui.set_has_session(snapshot.has_session);
     ui.set_playing(snapshot.state == PlaybackState::Playing);
@@ -92,6 +101,35 @@ fn apply(ui: &AppWindow, snapshot: &Snapshot) {
 
     ui.set_position_secs(segundos(snapshot.position_ticks));
     ui.set_duration_secs(segundos(snapshot.duration_ticks));
+
+    // La sesión que se está controlando y las disponibles.
+    ui.set_session_id(snapshot.session_id.clone().into());
+    ui.set_session_count(snapshot.sessions.len() as i32);
+
+    // El modelo solo se rehace cuando la lista cambia de verdad: reconstruirlo
+    // en cada foto reiniciaría el selector cada 100 ms.
+    let nueva: Vec<MediaSession> = snapshot
+        .sessions
+        .iter()
+        .map(|s| MediaSession {
+            id: SharedString::from(s.id.as_str()),
+            label: SharedString::from(s.label.as_str()),
+        })
+        .collect();
+    if cambio(&ui.get_sessions(), &nueva) {
+        ui.set_sessions(ModelRc::new(VecModel::from(nueva)));
+    }
+}
+
+/// Si la lista de sesiones de la UI es distinta de la que llega del backend.
+fn cambio(actual: &ModelRc<MediaSession>, nueva: &[MediaSession]) -> bool {
+    if actual.row_count() != nueva.len() {
+        return true;
+    }
+    (0..nueva.len()).any(|i| match actual.row_data(i) {
+        Some(fila) => fila.id != nueva[i].id || fila.label != nueva[i].label,
+        None => true,
+    })
 }
 
 /// Convierte ticks de 100 ns (unidad de `WinRT`) a segundos.

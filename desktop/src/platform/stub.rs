@@ -38,6 +38,9 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
                     can_seek: true,
                     position_ticks: position,
                     duration_ticks: TOTAL_SECS * TICKS_PER_SEC,
+                    // El shim no tiene sesiones reales que elegir.
+                    sessions: Vec::new(),
+                    session_id: String::new(),
                 });
             };
 
@@ -52,6 +55,8 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
                     Command::SeekForward => {
                         position = (position + 10 * TICKS_PER_SEC).min(TOTAL_SECS * TICKS_PER_SEC);
                     }
+                    // El shim solo tiene una sesión: no hay a qué cambiar.
+                    Command::SelectSession(_) => {}
                 }
                 publish(playing, position);
             }

@@ -110,7 +110,7 @@ enum Outcome {
 /// El estado que el bucle comparte entre iteraciones.
 struct State {
     finder: PlayerFinder,
-    /// Las sesiones disponibles.
+    /// Las sessions disponibles.
     sessions: Vec<Session>,
     /// El bus avisó que cambió el conjunto de reproductores.
     dirty: Arc<AtomicBool>,
@@ -261,7 +261,7 @@ fn handle(
         }
 
         // El bus avisó que cambió el conjunto de reproductores: la lista de
-        // sesiones se relee, pero solo de una vez.
+        // sessions se relee, pero solo de una vez.
         if state.dirty.swap(false, Ordering::Relaxed) {
             refresh(state);
         }
@@ -313,7 +313,7 @@ fn pick(state: &mut State, preferred: Option<&str>, exclude: Option<&str>) -> Op
     all.into_iter().nth(chosen)
 }
 
-/// Relee el bus y deja la lista de sesiones al día.
+/// Relee el bus y deja la lista de sessions al día.
 ///
 /// Devuelve los reproductores que hay, sin los proxies.
 fn refresh(state: &mut State) -> Vec<Player> {
@@ -347,13 +347,13 @@ fn is_proxy(bus_name: &str) -> bool {
     PROXY_NAMES.iter().any(|p| tail.eq_ignore_ascii_case(p))
 }
 
-/// Arma la lista de sesiones a partir de los reproductores del bus.
+/// Arma la lista de sessions a partir de los reproductores del bus.
 ///
 /// Cada reproductor es una sesión: dos ventanas del mismo navegador o dos
-/// instancias de mpv son sesiones distintas, aunque compartan nombre. Por eso
+/// instancias de mpv son sessions distintas, aunque compartan nombre. Por eso
 /// la clave es el nombre de bus y no la identidad.
 ///
-/// Cuando varias sesiones comparten nombre se numeran, para que el usuario
+/// Cuando varias sessions comparten nombre se numeran, para que el usuario
 /// pueda distinguirlas.
 fn build_sessions(players: &[Player]) -> Vec<Session> {
     let raw: Vec<(String, String)> = players
@@ -375,7 +375,7 @@ fn sessions_from(raw: &[(String, String)]) -> Vec<Session> {
         .collect();
 
     // Orden estable: por etiqueta y después por id. Así los números de las
-    // sesiones repetidas no cambian entre una foto y otra.
+    // sessions repetidas no cambian entre una foto y otra.
     sessions.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
 
     // Numerar las que comparten etiqueta.
@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn keeps_players_with_the_same_name_apart() {
-        // Dos ventanas del mismo navegador: mismo nombre, sesiones distintas.
-        let sesiones = sessions_from(&[
+        // Dos ventanas del mismo navegador: mismo nombre, sessions distintas.
+        let sessions = sessions_from(&[
             (
                 "org.mpris.MediaPlayer2.firefox.instance_1_40".to_string(),
                 "Mozilla zen".to_string(),
@@ -484,22 +484,22 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(sesiones.len(), 2);
+        assert_eq!(sessions.len(), 2);
         assert_eq!(
-            sesiones[0].id,
+            sessions[0].id,
             "org.mpris.MediaPlayer2.firefox.instance_1_40"
         );
-        assert_eq!(sesiones[0].label, "Mozilla zen (1)");
+        assert_eq!(sessions[0].label, "Mozilla zen (1)");
         assert_eq!(
-            sesiones[1].id,
+            sessions[1].id,
             "org.mpris.MediaPlayer2.firefox.instance_2_41"
         );
-        assert_eq!(sesiones[1].label, "Mozilla zen (2)");
+        assert_eq!(sessions[1].label, "Mozilla zen (2)");
     }
 
     #[test]
     fn leaves_unique_names_alone() {
-        let sesiones = sessions_from(&[
+        let sessions = sessions_from(&[
             (
                 "org.mpris.MediaPlayer2.mpv.instance-sLbacCqj".to_string(),
                 "mpv".to_string(),
@@ -510,8 +510,8 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(sesiones[0].label, "Mozilla zen");
-        assert_eq!(sesiones[1].label, "mpv");
+        assert_eq!(sessions[0].label, "Mozilla zen");
+        assert_eq!(sessions[1].label, "mpv");
     }
 
     #[test]

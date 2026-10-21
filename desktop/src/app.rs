@@ -108,7 +108,7 @@ fn apply(ui: &AppWindow, snapshot: &Snapshot) {
 
     // El modelo solo se rehace cuando la lista cambia de verdad: reconstruirlo
     // en cada foto reiniciaría el selector cada 100 ms.
-    let nueva: Vec<MediaSession> = snapshot
+    let new: Vec<MediaSession> = snapshot
         .sessions
         .iter()
         .map(|s| MediaSession {
@@ -116,18 +116,18 @@ fn apply(ui: &AppWindow, snapshot: &Snapshot) {
             label: SharedString::from(s.label.as_str()),
         })
         .collect();
-    if cambio(&ui.get_sessions(), &nueva) {
-        ui.set_sessions(ModelRc::new(VecModel::from(nueva)));
+    if changed(&ui.get_sessions(), &new) {
+        ui.set_sessions(ModelRc::new(VecModel::from(new)));
     }
 }
 
 /// Si la lista de sesiones de la UI es distinta de la que llega del backend.
-fn cambio(actual: &ModelRc<MediaSession>, nueva: &[MediaSession]) -> bool {
-    if actual.row_count() != nueva.len() {
+fn changed(current: &ModelRc<MediaSession>, new: &[MediaSession]) -> bool {
+    if current.row_count() != new.len() {
         return true;
     }
-    (0..nueva.len()).any(|i| match actual.row_data(i) {
-        Some(fila) => fila.id != nueva[i].id || fila.label != nueva[i].label,
+    (0..new.len()).any(|i| match current.row_data(i) {
+        Some(row) => row.id != new[i].id || row.label != new[i].label,
         None => true,
     })
 }

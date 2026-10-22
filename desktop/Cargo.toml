@@ -9,6 +9,23 @@ repository = "https://github.com/essence-s/sincronin-controlin"
 [dependencies]
 slint = { version = "1.18.1", features = ["raw-window-handle-06"] }
 crossbeam-channel = "0.5"
+# WebRTC sin IO: el modulo `net` maneja el socket UDP a mano.
+str0m = { version = "0.24", default-features = false, features = ["rust-crypto"] }
+# El WebSocket contra el servidor de senalizacion, en modo bloqueante.
+tungstenite = { version = "0.30", features = ["native-tls"] }
+serde_json = "1"
+# El sobre de los mensajes de senalizacion, compartido con el servidor.
+protocol = { path = "../protocol" }
+# Para los codigos de sala.
+rand = "0.9"
+# Para enumerar las interfaces de red.
+if-addrs = "0.13"
+
+# El servidor, solo para las pruebas de punta a punta: el binario que se
+# publica no lo lleva.
+[dev-dependencies]
+server = { path = "../server" }
+tokio = { version = "1", features = ["rt", "net"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
@@ -43,9 +60,3 @@ unsafe_op_in_unsafe_fn = "warn"
 
 [lints.clippy]
 all = "warn"
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = "s"
-strip = true

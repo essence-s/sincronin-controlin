@@ -1,0 +1,13 @@
+[workspace]
+members = ["desktop", "protocol", "server"]
+# Resolver 3: es el que corresponde a edition 2024 y el que separa las
+# dependencias por plataforma (la regla 7 del AGENTS.md depende de esto).
+resolver = "3"
+
+# El perfil va en la raiz del workspace: cargo ignora los perfiles de los
+# miembros que no son la raiz.
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true

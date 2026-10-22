@@ -5,7 +5,8 @@
 //! usa GSMTC (`Windows.Media.Control`) de forma 100 % dirigida por eventos.
 //!
 //! Regla del proyecto: `#[cfg(...)]` aparece **solo** dentro de
-//! [`platform`]. Este archivo y [`media`] son agnósticos de plataforma.
+//! [`platform`]. Este archivo, [`media`] y [`net`] son agnósticos de
+//! plataforma.
 //!
 //! Única excepción a la regla: el `#![cfg_attr]` de abajo. Controla si el
 //! binario muestra consola, y los atributos a nivel de crate no se pueden
@@ -15,10 +16,12 @@
 
 mod app;
 mod media;
+mod net;
 mod platform;
 
-// Genera `AppWindow` en la raíz del crate. Tiene que quedarse acá: los
-// módulos que reciben la ventana la referencian como `crate::AppWindow`.
+// Genera `AppWindow` y `NetWindow` en la raíz del crate. Tiene que
+// quedarse acá: los módulos que reciben la ventana la referencian como
+// `crate::AppWindow`.
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {

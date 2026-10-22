@@ -1,3 +1,52 @@
+// Campo de texto.
+//
+// Es un `TextInput` a pelo, no el `LineEdit` de los widgets estándar: con
+// este se puede pintar el fondo y el borde como el resto de la app, igual
+// en todas las plataformas. Con `read-only` el texto se puede seleccionar y
+// copiar con el teclado, pero no editar.
+component CodeField inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> read-only: false;
+    in property <string> placeholder: "";
+    in property <length> font-size: 13px;
+    in property <color> text-color: #f4f4f8;
+    in property <TextHorizontalAlignment> horizontal-alignment: left;
+    // Se dispara al apretar Enter: para conectar escribiendo el código.
+    callback accepted();
+
+    height: 30px;
+    border-radius: 6px;
+    background: #ffffff10;
+    border-width: 1px;
+    border-color: input.has-focus ? #7c7cff : #ffffff26;
+    clip: true;
+
+    // El texto de ejemplo, mientras no hay nada escrito.
+    if root.text == "" && root.placeholder != "": Text {
+        x: 10px;
+        text: root.placeholder;
+        color: #6f6f7c;
+        font-size: root.font-size;
+        vertical-alignment: center;
+    }
+
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text <=> root.text;
+        read-only: root.read-only;
+        single-line: true;
+        color: root.text-color;
+        font-size: root.font-size;
+        horizontal-alignment: root.horizontal-alignment;
+        vertical-alignment: center;
+        selection-background-color: #7c7cff;
+        selection-foreground-color: #ffffff;
+        accepted => { root.accepted(); }
+    }
+}
+
 // Botón con un ícono SVG centrado.
 //
 // Los íconos se cargan como imágenes (`@image-url`), no como elementos `Path`:
@@ -39,6 +88,43 @@ component IconButton inherits Rectangle {
     }
 }
 
+// Botón con texto.
+//
+// La barra no tiene botones con texto (son todos íconos), pero la ventana
+// de emparejamiento sí: son acciones que conviene leer.
+//
+// El botón se ajusta al texto: el `Text` va directo (no en un layout) para
+// que su ancho sea el natural y no dependa del botón. Un `Rectangle` en un
+// layout no tiene ancho propio y se invisible.
+component ActionButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> active: true;
+    callback clicked();
+
+    height: 30px;
+    border-radius: 8px;
+    background: touch.pressed ? #4d4d56 : (touch.has-hover ? #3a3a41 : #2c2c32);
+    opacity: root.active ? 1 : 0.4;
+
+    touch := TouchArea {
+        clicked => {
+            if root.active {
+                root.clicked();
+            }
+        }
+    }
+
+    txt := Text {
+        text: root.label;
+        color: #ececf3;
+        font-size: 12px;
+        x: 12px;
+        y: (root.height - txt.height) / 2;
+    }
+
+    width: txt.width + 24px;
+}
+
 // Una sesión de medios que se puede elegir.
 //
 // El `id` es con lo que el backend la reconoce (el nombre de bus de D-Bus en
@@ -71,6 +157,7 @@ component SessionChip inherits Rectangle {
         x: 7px;
         y: (root.height - txt.height) / 2;
     }
+
     width: txt.width + 14px;
 
     touch := TouchArea {
@@ -78,16 +165,33 @@ component SessionChip inherits Rectangle {
     }
 }
 
+// La ventana de la app.
+//
+// Son dos cosas en una sola ventana: la barra de siempre (420x84) y, arriba
+// de ella, el panel de emparejamiento por WebRTC.
+//
+// Una sola ventana a propósito: en Wayland no se puede "mostrar" una
+// ventana después de crearla (winit no puede mapear una superficie que ya
+// existe), asi que una segunda ventana Slint solo aparecería si se muestra
+// antes de que arranque el event loop. Con una ventana sola no hay nada que
+// mostrar ni esconder: la ventana crece y el compositor la re-ancla abajo.
 export component AppWindow inherits Window {
     title: "sincronin-controlin";
     no-frame: true;
     always-on-top: true;
     background: transparent;
-    preferred-width: 420px;
-    // Alto con espacio para la fila de sesiones, la barra de progreso y los
-    // márgenes. La ventana es siempre de este alto: si creciera al aparecer
-    // un reproductor, el compositor la ancla abajo y se saldría de la pantalla.
-    preferred-height: 84px;
+
+    // El ancho no cambia nunca, para que la barra no se corra de lugar.
+    width: 420px;
+    // Con el panel abierto la ventana es más alta. El compositor la ancla
+    // abajo (la regla de Hyprland se re-aplica al redimensionar), asi que
+    // crece hacia arriba y la barra no se mueve.
+    height: root.net-open ? 424px : 84px;
+
+    // El alto que quiere la ventana. En Windows lo usa el backend para
+    // anclar la ventana abajo: el tamaño nativo todavia no se actualizó
+    // cuando la app pide el cambio.
+    out property <length> wanted-height: root.height;
 
     in-out property <string> track-title: "Esperando al reproductor…";
     in-out property <string> track-artist: "";
@@ -104,10 +208,28 @@ export component AppWindow inherits Window {
     in property <int> session-count: 0;
     in property <string> session-id: "";
 
+    // El panel de emparejamiento.
+    in-out property <bool> net-open: false;
+    // El código de sala de este cliente.
+    in property <string> room-code: "";
+    // El código de sala del otro equipo: lo escribe el usuario.
+    in-out property <string> peer-room: "";
+    // El estado de la conexión.
+    in property <string> state-text: "Desconectado";
+    // Todo lo que pasó: avisos y mensajes recibidos.
+    in property <string> log-text: "";
+    // Si el canal de datos está abierto, se puede mandar.
+    in property <bool> can-send: false;
+
     callback toggle-play-pause();
     callback seek-backward();
     callback seek-forward();
     callback select-session(string);
+    callback connect(string);
+    callback disconnect();
+    callback send-message();
+    // La ventana cambió de alto: hay que volver a anclarla.
+    callback net-toggled();
     callback quit();
 
     Rectangle {
@@ -118,107 +240,276 @@ export component AppWindow inherits Window {
         border-width: 1px;
         border-color: #ffffff18;
 
-        // Toda la barra se puede arrastrar. Los botones se declaran después, así
-        // que quedan por encima y siguen recibiendo sus clics con normalidad.
+        // Toda la ventana se puede arrastrar. Los controles se declaran
+        // después, así que quedan por encima y siguen recibiendo sus clics
+        // con normalidad.
         WindowMoveArea { }
 
-        // Contenido: texto flexible a la izquierda, botones con su tamaño a la derecha.
-        // `cross-axis-alignment: center` es lo que los centra verticalmente.
-        HorizontalLayout {
+        VerticalLayout {
             x: 0;
             y: 0;
             width: parent.width;
             height: parent.height;
-            padding-left: 18px;
-            padding-right: 14px;
-            spacing: 12px;
-            cross-axis-alignment: center;
+            spacing: 0;
 
-            VerticalLayout {
-                horizontal-stretch: 1;
-                alignment: center;
-                spacing: 1px;
+            // El panel de emparejamiento, arriba de la barra.
+            if root.net-open: Rectangle {
+                vertical-stretch: 1;
 
-                Text {
-                    text: root.track-title;
-                    color: root.has-session ? #f4f4f8 : #8d8d99;
-                    font-size: 14px;
-                    overflow: elide;
-                }
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 8px;
 
-                Text {
-                    text: root.track-artist;
-                    color: #9a9aa6;
-                    font-size: 11px;
-                    overflow: elide;
-                }
+                    Text {
+                        text: "Emparejar con otro equipo";
+                        color: #f4f4f8;
+                        font-size: 15px;
+                    }
 
-                // Selector de sesión: solo aparece cuando hay más de una.
-                if root.session-count > 1: HorizontalLayout {
-                    horizontal-stretch: 0;
-                    spacing: 5px;
+                    Text {
+                        text: "Tu código de sala lo genera esta máquina. Pasáselo al otro equipo y apretá Conectar para esperarlo.";
+                        color: #8d8d99;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
 
-                    for session in root.sessions: SessionChip {
-                        label: session.label;
-                        selected: session.id == root.session-id;
-                        clicked => { root.select-session(session.id); }
+                    // Nuestra sala. El campo es de solo lectura para que se
+                    // pueda seleccionar y copiar con el teclado.
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Tu sala";
+                            color: #9a9aa6;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+
+                        CodeField {
+                            text: root.room-code;
+                            read-only: true;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            horizontal-stretch: 0;
+                            width: 110px;
+                        }
+
+                        Text {
+                            text: "copialo y pasáselo";
+                            color: #6f6f7c;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // La sala del otro equipo. Si se deja vacío, se entra a
+                    // la sala propia.
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Sala del otro";
+                            color: #9a9aa6;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+
+                        CodeField {
+                            text <=> root.peer-room;
+                            placeholder: "código de 6 letras (o vacío = tu sala)";
+                            font-size: 13px;
+                            horizontal-stretch: 1;
+                            // Con Enter se conecta: no hace falta acertar
+                            // el botón.
+                            accepted => { root.connect(root.peer-room); }
+                        }
+
+                        ActionButton {
+                            label: "Conectar";
+                            clicked => { root.connect(root.peer-room); }
+                        }
+                    }
+
+                    // El estado y las acciones.
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Text {
+                            text: root.state-text;
+                            color: #d6d6e0;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+
+                        ActionButton {
+                            label: "Enviar hola";
+                            active: root.can-send;
+                            clicked => { root.send-message(); }
+                        }
+
+                        ActionButton {
+                            label: "Desconectar";
+                            clicked => { root.disconnect(); }
+                        }
+
+                        ActionButton {
+                            label: "Cerrar";
+                            clicked => {
+                                root.net-open = false;
+                                root.net-toggled();
+                            }
+                        }
+                    }
+
+                    // El registro: los avisos y los mensajes que llegan.
+                    Rectangle {
+                        vertical-stretch: 1;
+                        border-radius: 8px;
+                        background: #ffffff08;
+                        border-width: 1px;
+                        border-color: #ffffff12;
+                        clip: true;
+
+                        Text {
+                            x: 10px;
+                            y: 8px;
+                            width: parent.width - 20px;
+                            height: parent.height - 16px;
+                            text: root.log-text;
+                            color: #b9b9c6;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }
 
-            HorizontalLayout {
-                alignment: center;
-                spacing: 4px;
+            // La barra de siempre. Está en su propio rectángulo para que la
+            // línea de progreso sea relativa a la barra y no a la ventana
+            // (que crece).
+            Rectangle {
+                height: 84px;
 
-                IconButton {
-                    icon: @image-url("../assets/icons/replay_10.svg");
-                    active: root.has-session && root.can-seek;
-                    clicked => { root.seek-backward(); }
+                // Contenido: texto flexible a la izquierda, botones con su
+                // tamaño a la derecha.
+                // `cross-axis-alignment: center` es lo que los centra
+                // verticalmente.
+                HorizontalLayout {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    padding-left: 18px;
+                    padding-right: 14px;
+                    spacing: 12px;
+                    cross-axis-alignment: center;
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 1px;
+
+                        Text {
+                            text: root.track-title;
+                            color: root.has-session ? #f4f4f8 : #8d8d99;
+                            font-size: 14px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.track-artist;
+                            color: #9a9aa6;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        // Selector de sesión: solo aparece cuando hay más de una.
+                        if root.session-count > 1: HorizontalLayout {
+                            horizontal-stretch: 0;
+                            spacing: 5px;
+
+                            for session in root.sessions: SessionChip {
+                                label: session.label;
+                                selected: session.id == root.session-id;
+                                clicked => { root.select-session(session.id); }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 4px;
+
+                        IconButton {
+                            icon: @image-url("../assets/icons/replay_10.svg");
+                            active: root.has-session && root.can-seek;
+                            clicked => { root.seek-backward(); }
+                        }
+
+                        IconButton {
+                            icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
+                            active: root.has-session && root.can-toggle;
+                            clicked => { root.toggle-play-pause(); }
+                        }
+
+                        IconButton {
+                            icon: @image-url("../assets/icons/forward_10.svg");
+                            active: root.has-session && root.can-seek;
+                            clicked => { root.seek-forward(); }
+                        }
+
+                        // Abre y cierra el panel de emparejamiento.
+                        IconButton {
+                            icon: @image-url("../assets/icons/link.svg");
+                            icon-size: 20px;
+                            // El color muestra si el panel está abierto. No
+                            // se usa `active`: ese flag hace que el botón
+                            // ignore los clics, y este tiene que poder
+                            // cerrar el panel.
+                            tint: root.net-open ? #7c7cff : #f2f2f6;
+                            clicked => {
+                                root.net-open = !root.net-open;
+                                root.net-toggled();
+                            }
+                        }
+
+                        IconButton {
+                            icon: @image-url("../assets/icons/close.svg");
+                            icon-size: 15px;
+                            tint: #e2e2ea;
+                            clicked => { root.quit(); }
+                        }
+                    }
                 }
 
-                IconButton {
-                    icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
-                    active: root.has-session && root.can-toggle;
-                    clicked => { root.toggle-play-pause(); }
+                // Línea de progreso: riel y relleno como hermanos, para que las
+                // posiciones sean inequívocas.
+                //
+                // El ancho deja lugar para los cinco botones de la derecha
+                // (34 px cada uno, más 4 px de separación) y los márgenes.
+                Rectangle {
+                    x: 18px;
+                    y: parent.height - 9px;
+                    width: parent.width - 226px;
+                    height: 3px;
+                    border-radius: 1.5px;
+                    background: #ffffff1c;
                 }
 
-                IconButton {
-                    icon: @image-url("../assets/icons/forward_10.svg");
-                    active: root.has-session && root.can-seek;
-                    clicked => { root.seek-forward(); }
-                }
-
-                IconButton {
-                    icon: @image-url("../assets/icons/close.svg");
-                    icon-size: 15px;
-                    tint: #e2e2ea;
-                    clicked => { root.quit(); }
+                Rectangle {
+                    x: 18px;
+                    y: parent.height - 9px;
+                    height: 3px;
+                    border-radius: 1.5px;
+                    background: #7c7cff;
+                    width: root.duration-secs > 0
+                        ? min(
+                            (root.position-secs * (parent.width - 226px)) / root.duration-secs,
+                            parent.width - 226px)
+                        : 0px;
                 }
             }
-        }
-
-        // Línea de progreso: riel y relleno como hermanos, para que las
-        // posiciones sean inequívocas.
-        Rectangle {
-            x: 18px;
-            y: parent.height - 9px;
-            width: parent.width - 188px;
-            height: 3px;
-            border-radius: 1.5px;
-            background: #ffffff1c;
-        }
-
-        Rectangle {
-            x: 18px;
-            y: parent.height - 9px;
-            height: 3px;
-            border-radius: 1.5px;
-            background: #7c7cff;
-            width: root.duration-secs > 0
-                ? min(
-                    (root.position-secs * (parent.width - 188px)) / root.duration-secs,
-                    parent.width - 188px)
-                : 0px;
         }
     }
 }

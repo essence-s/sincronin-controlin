@@ -113,19 +113,19 @@ fn position_bottom_center(ui: &AppWindow) {
         return;
     }
 
-    let mut window_size = ui.window().size();
-    if window_size.width == 0 || window_size.height == 0 {
-        // Todavía no hay tamaño real: usamos el preferido escalado.
-        let scale = ui.window().scale_factor();
-        window_size = slint::PhysicalSize::new(
-            (420.0 * scale).round() as u32,
-            (72.0 * scale).round() as u32,
-        );
-    }
+    // El alto que *quiere* la ventana, no el que tiene: cuando se abre el
+    // panel de emparejamiento la app pide una ventana más alta, pero la
+    // nativa todavía no se redimensionó cuando llega acá. Con el alto viejo
+    // la ventana quedaría medio fuera de la pantalla.
+    let scale = ui.window().scale_factor();
+    let height = (ui.get_wanted_height() * scale).round() as u32;
 
-    let width = area.right - area.left;
-    let x = area.left + (width - window_size.width as i32) / 2;
-    let y = area.bottom - window_size.height as i32 - BOTTOM_MARGIN;
+    // El ancho no cambia nunca, así que el nativo sirve.
+    let width = ui.window().size().width;
+
+    let available = area.right - area.left;
+    let x = area.left + (available - width as i32) / 2;
+    let y = area.bottom - height as i32 - BOTTOM_MARGIN;
 
     ui.window().set_position(slint::PhysicalPosition::new(x, y));
 }

@@ -54,6 +54,14 @@ const SIGNAL_URL_ENV: &str = "SINC_SIGNAL_URL";
 /// Variable de entorno para fijar la dirección local del socket UDP.
 const LOCAL_ADDR_ENV: &str = "SINC_NET_ADDR";
 
+/// Servidor STUN por defecto, para descubrir la dirección pública.
+#[cfg(not(test))]
+const DEFAULT_STUN_SERVER: &str = "stun.l.google.com:19302";
+
+/// Variable de entorno para cambiar el servidor STUN. Vacío lo desactiva.
+#[cfg(not(test))]
+const STUN_ADDR_ENV: &str = "SINC_STUN_ADDR";
+
 /// Lo que la UI le manda al módulo de red.
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -229,6 +237,45 @@ pub fn local_address_hint() -> Option<std::net::IpAddr> {
     None
 }
 
+/// El servidor STUN que se consulta para descubrir la dirección pública.
+///
+/// Sale de `SINC_STUN_ADDR` si está; si no, de un servidor público.
+/// Un valor vacío lo desactiva: la conexión queda solo con candidatos de
+/// host, que alcanza en la propia red pero no a través de un NAT.
+pub fn stun_server() -> Option<String> {
+    // En las pruebas no hay servidor STUN salvo que el test lo fije.
+    #[cfg(test)]
+    return TEST_STUN_ADDR.get().and_then(Clone::clone);
+
+    #[cfg(not(test))]
+    {
+        let raw = std::env::var(STUN_ADDR_ENV).unwrap_or_else(|_| DEFAULT_STUN_SERVER.to_string());
+        strip_stun_uri(raw.trim()).map(str::to_string)
+    }
+}
+
+/// El servidor STUN fijado a mano. Solo existe en las pruebas.
+#[cfg(test)]
+static TEST_STUN_ADDR: OnceLock<Option<String>> = OnceLock::new();
+
+/// Le saca el prefijo `stun:` de un URI de servidor STUN.
+///
+/// Devuelve `None` si queda vacío: es así como se desactiva.
+#[cfg(not(test))]
+fn strip_stun_uri(raw: &str) -> Option<&str> {
+    let without = raw
+        .strip_prefix("stun://")
+        .or_else(|| raw.strip_prefix("stun:"))
+        .unwrap_or(raw)
+        .trim();
+
+    if without.is_empty() {
+        None
+    } else {
+        Some(without)
+    }
+}
+
 /// Publica un estado.
 pub(crate) fn publish_state(sink: &Sink, state: NetState) {
     sink(Event::State(state));
@@ -271,6 +318,10 @@ mod tests {
 
     /// La sala donde empieza B, antes de cambiar a la de A.
     const SWITCH_ROOM_B: &str = "M5T8RS";
+
+    /// La sala del test de STUN: cada test usa la suya, porque corren
+    /// en paralelo y el servidor agrupa por sala.
+    const STUN_ROOM: &str = "J4X8TZ";
 
     #[test]
     fn a_room_code_has_the_right_shape() {
@@ -439,6 +490,58 @@ mod tests {
         });
     }
 
+    /// El servidor STUN contestó a los dos: anuncia la dirección pública.
+    fn stun_responded(events: &[Event]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Notice(text) if text.contains("dirección pública")))
+    }
+
+    /// Dos equipos se emparejan con candidatos server reflexive: el
+    /// binding STUN sale, la respuesta trae la dirección pública y esta
+    /// queda anunciada en los dos.
+    ///
+    /// En una sola máquina no hay NAT (y el `srflx` difiere del `host` en
+    /// el puerto que inventa el servidor de pruebas), pero sí ejercita el
+    /// camino completo: query, respuesta, candidato, trickle.
+    #[test]
+    fn two_clients_pair_with_server_reflexive_candidates() {
+        let _ = test_server();
+        test_stun_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: STUN_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        cmd_b
+            .send(Command::Connect {
+                room: STUN_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        // La conexión no depende del STUN (el host alcanza en red propia),
+        // pero sí que el STUN haya contestado en los dos.
+        wait_for(&events_a, channel_opened);
+        wait_for(&events_b, channel_opened);
+        wait_for(&events_a, stun_responded);
+        wait_for(&events_b, stun_responded);
+
+        // Y el hola viaja igual de bien.
+        cmd_a
+            .send(Command::Send("hola".to_string()))
+            .expect("el canal de comandos está abierto");
+
+        wait_for(&events_b, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "hola"))
+        });
+    }
+
     /// Si el canal de datos se abrió.
     fn channel_opened(events: &[Event]) -> bool {
         events.iter().any(
@@ -485,6 +588,68 @@ mod tests {
 
         let addr = addr_rx.recv().expect("el servidor arranca");
         format!("ws://{addr}/ws")
+    }
+
+    /// El servidor STUN de las pruebas: se levanta una sola vez y lo fija
+    /// en la configuración de red.
+    ///
+    /// Solo contesta binding requests, con una dirección mapeada falsa: la
+    /// IP del que preguntó y el puerto aledaño, como si hubiera un NAT que
+    /// cambiara el par. Como no hay NAT real, el `srflx` queda distinto
+    /// del `host` sin llegar a romper la conexión.
+    fn test_stun_server() {
+        static ADDR: OnceLock<String> = OnceLock::new();
+
+        ADDR.get_or_init(|| {
+            let addr = start_stun_server();
+            TEST_STUN_ADDR
+                .set(Some(addr.clone()))
+                .expect("el servidor STUN se fija una sola vez");
+            addr
+        });
+    }
+
+    /// Levanta el servidor STUN de pruebas en un puerto efimero.
+    fn start_stun_server() -> String {
+        use crate::net::peer::{STUN_MAGIC, STUN_REQUEST_TYPE, binding_success_reply};
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        std::thread::Builder::new()
+            .name("test-stun".to_string())
+            .spawn(move || {
+                let socket =
+                    std::net::UdpSocket::bind("127.0.0.1:0").expect("socket STUN de pruebas");
+                let addr = socket.local_addr().expect("dirección STUN de pruebas");
+                addr_tx
+                    .send(format!("{addr}"))
+                    .expect("se recibe la dirección");
+
+                // Contesta hasta que el proceso de pruebas muere.
+                let mut buf = [0u8; 1500];
+                while let Ok((n, source)) = socket.recv_from(&mut buf) {
+                    // Solo binding requests: tipo y magic cookie.
+                    if n < 20 {
+                        continue;
+                    }
+                    if u16::from_be_bytes([buf[0], buf[1]]) != STUN_REQUEST_TYPE {
+                        continue;
+                    }
+                    if buf[4..8] != STUN_MAGIC {
+                        continue;
+                    }
+
+                    // La dirección "pública" falsa: la misma IP y el puerto
+                    // siguiente.
+                    let mapped = std::net::SocketAddr::new(source.ip(), source.port() + 1);
+                    let reply = binding_success_reply(&buf[..n], mapped);
+
+                    let _ = socket.send_to(&reply, source);
+                }
+            })
+            .expect("no se pudo crear el hilo STUN");
+
+        addr_rx.recv().expect("el servidor STUN arranca")
     }
 
     /// Un cliente de red: el canal de comandos y donde se anotan los

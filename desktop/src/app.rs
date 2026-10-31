@@ -244,7 +244,13 @@ fn apply_net(ui: &AppWindow, event: &net::Event, in_room: &AtomicBool) {
         net::Event::Notice(text) => {
             append_log(ui, &format!("· {text}"));
         }
-        net::Event::AssignedRole(_) => {}
+        net::Event::AssignedRole(role) => {
+            let texto = match role {
+                net::Role::Controlado => "controlado",
+                net::Role::Controlador => "controlador",
+            };
+            ui.set_role_text(texto.into());
+        }
     }
 }
 

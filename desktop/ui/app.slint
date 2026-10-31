@@ -216,6 +216,8 @@ export component AppWindow inherits Window {
     in-out property <string> peer-room: "";
     // El estado de la conexión.
     in property <string> state-text: "Desconectado";
+    // El rol asignado en la sala: controlado o controlador.
+    in property <string> role-text: "";
     // Todo lo que pasó: avisos y mensajes recibidos.
     in property <string> log-text: "";
     // Si el canal de datos está abierto, se puede mandar.
@@ -340,6 +342,13 @@ export component AppWindow inherits Window {
                             font-size: 12px;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
+                        }
+
+                        Text {
+                            text: root.role-text;
+                            color: #7c7cff;
+                            font-size: 12px;
+                            vertical-alignment: center;
                         }
 
                         ActionButton {

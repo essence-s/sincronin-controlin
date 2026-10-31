@@ -678,7 +678,9 @@ mod tests {
             .expect("el canal de comandos está abierta");
 
         wait_for(&events_a, |events| {
-            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado))
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado),
+            )
         });
     }
 
@@ -697,7 +699,9 @@ mod tests {
             })
             .expect("el canal de comandos está abierta");
         wait_for(&events_a, |events| {
-            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado))
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado),
+            )
         });
 
         // B entra después: controlador.
@@ -707,7 +711,9 @@ mod tests {
             })
             .expect("el canal de comandos está abierta");
         wait_for(&events_b, |events| {
-            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador))
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador),
+            )
         });
     }
 
@@ -726,7 +732,9 @@ mod tests {
             })
             .expect("el canal de comandos está abierta");
         wait_for(&events_a, |events| {
-            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado))
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado),
+            )
         });
 
         // B entra después: A no cambia de rol.
@@ -737,7 +745,9 @@ mod tests {
             .expect("el canal de comandos está abierta");
 
         wait_for(&events_b, |events| {
-            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador))
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador),
+            )
         });
 
         // A sigue siendo controlado (no recibió otro Event::AssignedRole diferente).

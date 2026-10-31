@@ -244,6 +244,7 @@ fn apply_net(ui: &AppWindow, event: &net::Event, in_room: &AtomicBool) {
         net::Event::Notice(text) => {
             append_log(ui, &format!("· {text}"));
         }
+        net::Event::AssignedRole(_) => {}
     }
 }
 

@@ -20,7 +20,7 @@ use tungstenite::stream::MaybeTlsStream;
 
 use protocol::{ClientMessage, Frame, ServerMessage, VERSION};
 
-use crate::net::{self, Command, NetState, PeerCommand, PeerOut, Sink};
+use crate::net::{self, Command, NetState, PeerCommand, PeerOut, Role, Sink};
 
 /// Cuanto espera el socket a una lectura antes de volver al bucle.
 ///
@@ -306,6 +306,9 @@ fn handle_server(text: &str, our_id: &mut Option<u64>, peer_tx: &Sender<PeerComm
 
             if peers.is_empty() {
                 eprintln!("[net] esperando a que otro equipo entre en la sala {room}");
+                net::publish_role(sink, Role::Controlado);
+            } else {
+                net::publish_role(sink, Role::Controlador);
             }
         }
         ServerMessage::PeerJoined { peer } => {

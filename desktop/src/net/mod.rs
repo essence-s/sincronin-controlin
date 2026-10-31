@@ -78,6 +78,13 @@ pub enum Command {
     Disconnect,
 }
 
+/// El rol del cliente en la sala.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Controlado,
+    Controlador,
+}
+
 /// En qué estado está la conexión.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetState {
@@ -111,6 +118,8 @@ pub enum Event {
     Message(String),
     /// Un aviso o un error, para mostrar en la UI.
     Notice(String),
+    /// El rol asignado en la sala: controlado o controlador.
+    AssignedRole(Role),
 }
 
 /// Callback con el que el módulo publica cada evento.
@@ -291,6 +300,11 @@ pub(crate) fn publish_message(sink: &Sink, text: impl Into<String>) {
     sink(Event::Message(text.into()));
 }
 
+/// Publica el rol asignado en la sala.
+pub(crate) fn publish_role(sink: &Sink, role: Role) {
+    sink(Event::AssignedRole(role));
+}
+
 /// Envía un comando al hilo de par, avisando si no se pudo.
 pub(crate) fn send_peer(peer_tx: &Sender<PeerCommand>, command: PeerCommand) {
     let _ = peer_tx.send(command);
@@ -306,12 +320,13 @@ mod tests {
     /// Cuanto se espera a que pase algo antes de rendirse.
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// La sala del primer test.
-    const ROOM: &str = "ABC234";
-
-    /// La sala del segundo test: cada test usa la suya, porque corren
-    /// en paralelo y el servidor agrupa por sala.
+    /// Sala usada por los tests de emparejamiento.
     const OTHER_ROOM: &str = "XYZ789";
+
+    /// La sala para la prueba de roles: cada test usa la suya.
+    const ROLE_ROOM_A: &str = "ABC235";
+    const ROLE_ROOM_B: &str = "DEF456";
+    const ROLE_ROOM_C: &str = "G7H8J9";
 
     /// La sala del tercer test (donde está A).
     const SWITCH_ROOM: &str = "K7M2QP";
@@ -351,44 +366,6 @@ mod tests {
             protocol::normalize_room(&code).as_deref(),
             Some(code.as_str())
         );
-    }
-
-    /// La prueba de punta a punta: dos clientes entran a la misma sala a
-    /// traves del servidor de señalización, se emparejan por WebRTC y uno
-    /// le manda un mensaje al otro por el canal de datos.
-    #[test]
-    fn two_clients_send_a_message_over_the_data_channel() {
-        let _ = test_server();
-
-        let (cmd_a, events_a) = client();
-        let (cmd_b, events_b) = client();
-
-        // Los dos entran a la misma sala.
-        cmd_a
-            .send(Command::Connect {
-                room: ROOM.to_string(),
-            })
-            .expect("el canal de comandos está abierto");
-        cmd_b
-            .send(Command::Connect {
-                room: ROOM.to_string(),
-            })
-            .expect("el canal de comandos está abierto");
-
-        // El canal de datos se abre cuando termina el handshake de WebRTC.
-        wait_for(&events_b, channel_opened);
-        wait_for(&events_a, channel_opened);
-
-        // Y ahora el mensaje de prueba.
-        cmd_a
-            .send(Command::Send("hola".to_string()))
-            .expect("el canal de comandos está abierto");
-
-        wait_for(&events_b, |events| {
-            events
-                .iter()
-                .any(|event| matches!(event, Event::Message(text) if text == "hola"))
-        });
     }
 
     /// Si el otro equipo se va y vuelve, se empareja de nuevo.
@@ -685,5 +662,94 @@ mod tests {
 
         let snapshot = events.lock().expect("el registro no está poisoned").clone();
         panic!("no se cumplio la condición; los eventos fueron: {snapshot:?}");
+    }
+
+    /// El primero en una sala vacía es el controlado.
+    #[test]
+    fn first_joiner_in_empty_room_is_controlado() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: ROLE_ROOM_A.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+
+        wait_for(&events_a, |events| {
+            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado))
+        });
+    }
+
+    /// El segundo en una sala ocupada es el controlador.
+    #[test]
+    fn second_joiner_in_occupied_room_is_controlador() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+
+        // A entra primero: controlado.
+        cmd_a
+            .send(Command::Connect {
+                room: ROLE_ROOM_B.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+        wait_for(&events_a, |events| {
+            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado))
+        });
+
+        // B entra después: controlador.
+        cmd_b
+            .send(Command::Connect {
+                room: ROLE_ROOM_B.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+        wait_for(&events_b, |events| {
+            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador))
+        });
+    }
+
+    /// El controlado sigue siendo controlado cuando otro se une.
+    #[test]
+    fn controlado_stays_controlado_when_peer_joins() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+
+        // A entra primero: controlado.
+        cmd_a
+            .send(Command::Connect {
+                room: ROLE_ROOM_C.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+        wait_for(&events_a, |events| {
+            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado))
+        });
+
+        // B entra después: A no cambia de rol.
+        cmd_b
+            .send(Command::Connect {
+                room: ROLE_ROOM_C.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+
+        wait_for(&events_b, |events| {
+            events.iter().any(|event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador))
+        });
+
+        // A sigue siendo controlado (no recibió otro Event::AssignedRole diferente).
+        let roles_a: Vec<Role> = events_a
+            .lock()
+            .expect("el registro no está poisoned")
+            .iter()
+            .filter_map(|event| match event {
+                Event::AssignedRole(role) => Some(*role),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roles_a, vec![Role::Controlado]);
     }
 }

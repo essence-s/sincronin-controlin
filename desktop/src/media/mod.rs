@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 /// Orden que envía la UI al backend.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     TogglePlayPause,
     SeekBackward,

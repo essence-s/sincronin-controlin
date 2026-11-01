@@ -306,6 +306,18 @@ fn media_controls_gated(role: net::Role, can_toggle: bool, can_seek: bool) -> (b
     }
 }
 
+/// Traduce un mensaje de texto del canal de datos a un comando de medios.
+///
+/// Solo reconoce comandos simples de un solo comando. Un mensaje que no
+/// sea un comando válido devuelve `None` y se ignora.
+#[allow(dead_code)]
+fn parse_media_command(text: &str) -> Option<crate::media::Command> {
+    match text.trim() {
+        "play" => Some(crate::media::Command::TogglePlayPause),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +338,19 @@ mod tests {
     fn controlador_disables_media_controls_when_no_session() {
         let (toggle, seek) = media_controls_gated(net::Role::Controlador, false, false);
         assert_eq!((toggle, seek), (false, false));
+    }
+
+    #[test]
+    fn parse_media_command_play() {
+        let cmd = parse_media_command("play");
+        assert_eq!(cmd, Some(crate::media::Command::TogglePlayPause));
+    }
+
+    #[test]
+    fn parse_media_command_ignores_invalid() {
+        let cmd = parse_media_command("hola");
+        assert_eq!(cmd, None);
+        let cmd = parse_media_command("");
+        assert_eq!(cmd, None);
     }
 }

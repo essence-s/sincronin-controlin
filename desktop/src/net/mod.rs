@@ -327,6 +327,7 @@ mod tests {
     const ROLE_ROOM_A: &str = "ABC235";
     const ROLE_ROOM_B: &str = "DEF456";
     const ROLE_ROOM_C: &str = "G7H8J9";
+    const ROLE_ROOM_D: &str = "H3K5M7";
 
     /// La sala del tercer test (donde está A).
     const SWITCH_ROOM: &str = "K7M2QP";
@@ -761,5 +762,69 @@ mod tests {
             })
             .collect();
         assert_eq!(roles_a, vec![Role::Controlado]);
+    }
+
+    /// Un controlador que se desconecta y vuelve a la misma sala sigue
+    /// siendo controlador: no hay dos controlados en una misma sala.
+    #[test]
+    fn controlador_remains_controlador_on_reconnect_to_same_room() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+
+        // A entra primero: controlado.
+        cmd_a
+            .send(Command::Connect {
+                room: ROLE_ROOM_D.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+        wait_for(&events_a, |events| {
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado),
+            )
+        });
+
+        // B entra después: controlador.
+        cmd_b
+            .send(Command::Connect {
+                room: ROLE_ROOM_D.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+        wait_for(&events_b, |events| {
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador),
+            )
+        });
+
+        // B se desconecta.
+        cmd_b
+            .send(Command::Disconnect)
+            .expect("el canal de comandos está abierta");
+
+        // B vuelve a la misma sala: debe seguir siendo controlador.
+        cmd_b
+            .send(Command::Connect {
+                room: ROLE_ROOM_D.to_string(),
+            })
+            .expect("el canal de comandos está abierta");
+
+        wait_for(&events_b, |events| {
+            events.iter().any(
+                |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlador),
+            )
+        });
+
+        // B no recibió un rol de controlado.
+        let roles_b: Vec<Role> = events_b
+            .lock()
+            .expect("el registro no está poisoned")
+            .iter()
+            .filter_map(|event| match event {
+                Event::AssignedRole(role) => Some(*role),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roles_b, vec![Role::Controlador]);
     }
 }

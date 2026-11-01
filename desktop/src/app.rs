@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{Sender, unbounded};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::media::{Command, PlaybackState, Sink, Snapshot};
@@ -58,15 +58,22 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // los de medios.
     let (net_cmd_tx, net_cmd_rx) = unbounded::<net::Command>();
 
+    // El canal de comandos de medios también se usa para ejecutar los
+    // mensajes que llegan por el canal de datos (el controlado aplica
+    // localmente lo que el controlador le envía).
+    let media_tx = cmd_tx.clone();
+
     let net_sink: net::Sink = {
         let weak = ui.as_weak();
         let in_room = Arc::clone(&in_room);
         let is_controlador = Arc::clone(&is_controlador);
+        let media_tx = media_tx.clone();
         Arc::new(move |event: net::Event| {
             let in_room = Arc::clone(&in_room);
             let is_controlador = Arc::clone(&is_controlador);
+            let media_tx = media_tx.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                apply_net(&ui, &event, &in_room, &is_controlador);
+                apply_net(&ui, &event, &in_room, &is_controlador, &media_tx);
             });
         })
     };
@@ -74,21 +81,34 @@ pub fn run() -> Result<(), slint::PlatformError> {
     net::spawn(net_cmd_rx, net_sink);
 
     {
-        let tx = cmd_tx.clone();
+        let tx = net_cmd_tx.clone();
+        let weak = ui.as_weak();
         ui.on_toggle_play_pause(move || {
-            let _ = tx.send(Command::TogglePlayPause);
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let playing = ui.get_playing();
+            let cmd = if playing { "pause" } else { "play" };
+            let _ = tx.send(net::Command::Send(cmd.to_string()));
         });
     }
     {
-        let tx = cmd_tx.clone();
+        let tx = net_cmd_tx.clone();
         ui.on_seek_backward(move || {
-            let _ = tx.send(Command::SeekBackward);
+            let _ = tx.send(net::Command::Send("seek_backward".to_string()));
         });
     }
     {
-        let tx = cmd_tx.clone();
+        let tx = net_cmd_tx.clone();
         ui.on_seek_forward(move || {
-            let _ = tx.send(Command::SeekForward);
+            let _ = tx.send(net::Command::Send("seek_forward".to_string()));
+        });
+    }
+    {
+        let tx = net_cmd_tx.clone();
+        ui.on_seek_to(move |secs: f32| {
+            let ticks = (secs as f64 * 10_000_000.0) as i64;
+            let _ = tx.send(net::Command::Send(format!("seek_to {ticks}")));
         });
     }
     {
@@ -258,6 +278,7 @@ fn apply_net(
     event: &net::Event,
     in_room: &AtomicBool,
     is_controlador: &AtomicBool,
+    media_tx: &Sender<Command>,
 ) {
     match event {
         net::Event::State(state) => {
@@ -266,7 +287,14 @@ fn apply_net(
             ui.set_can_send(*state == net::NetState::Conectado);
         }
         net::Event::Message(text) => {
-            append_log(ui, &format!("← {text}"));
+            // Los mensajes que son comandos de medios se ejecutan en el
+            // reproductor local (es el controlado aplicando lo que el
+            // controlador le envió). Lo que no es un comando se registra.
+            if let Some(cmd) = parse_media_command(text) {
+                let _ = media_tx.send(cmd);
+            } else {
+                append_log(ui, &format!("← {text}"));
+            }
         }
         net::Event::Notice(text) => {
             append_log(ui, &format!("· {text}"));
@@ -312,8 +340,17 @@ fn media_controls_gated(role: net::Role, can_toggle: bool, can_seek: bool) -> (b
 /// sea un comando válido devuelve `None` y se ignora.
 #[allow(dead_code)]
 fn parse_media_command(text: &str) -> Option<crate::media::Command> {
-    match text.trim() {
-        "play" => Some(crate::media::Command::TogglePlayPause),
+    let text = text.trim();
+    match text {
+        "play" => Some(crate::media::Command::Play),
+        "pause" => Some(crate::media::Command::Pause),
+        "stop" => Some(crate::media::Command::Stop),
+        "seek_backward" => Some(crate::media::Command::SeekBackward),
+        "seek_forward" => Some(crate::media::Command::SeekForward),
+        _ if text.starts_with("seek_to ") => {
+            let rest = text["seek_to ".len()..].trim();
+            rest.parse::<i64>().ok().map(crate::media::Command::SeekTo)
+        }
         _ => None,
     }
 }
@@ -343,7 +380,7 @@ mod tests {
     #[test]
     fn parse_media_command_play() {
         let cmd = parse_media_command("play");
-        assert_eq!(cmd, Some(crate::media::Command::TogglePlayPause));
+        assert_eq!(cmd, Some(crate::media::Command::Play));
     }
 
     #[test]
@@ -352,5 +389,23 @@ mod tests {
         assert_eq!(cmd, None);
         let cmd = parse_media_command("");
         assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn parse_media_command_pause() {
+        let cmd = parse_media_command("pause");
+        assert_eq!(cmd, Some(crate::media::Command::Pause));
+    }
+
+    #[test]
+    fn parse_media_command_stop() {
+        let cmd = parse_media_command("stop");
+        assert_eq!(cmd, Some(crate::media::Command::Stop));
+    }
+
+    #[test]
+    fn parse_media_command_seek_to() {
+        let cmd = parse_media_command("seek_to 125000");
+        assert_eq!(cmd, Some(crate::media::Command::SeekTo(125000)));
     }
 }

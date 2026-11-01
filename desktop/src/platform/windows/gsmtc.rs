@@ -563,20 +563,56 @@ fn execute(cmd: Command, watch: Option<&Watch>) {
     let session = &w.session;
 
     match cmd {
-        Command::TogglePlayPause => {
-            match session.TryTogglePlayPauseAsync().and_then(|op| op.join()) {
-                Ok(false) => eprintln!("[media] la aplicación no aceptó play/pausa"),
-                Err(err) => eprintln!("[media] error en play/pausa: {err}"),
-                Ok(true) => {}
-            }
-        }
+        Command::Play => match session.TryPlayAsync().and_then(|op| op.join()) {
+            Ok(false) => eprintln!("[media] la aplicación no aceptó reproducir"),
+            Err(err) => eprintln!("[media] error al reproducir: {err}"),
+            Ok(true) => {}
+        },
+        Command::Pause => match session.TryPauseAsync().and_then(|op| op.join()) {
+            Ok(false) => eprintln!("[media] la aplicación no aceptó pausa"),
+            Err(err) => eprintln!("[media] error en pausa: {err}"),
+            Ok(true) => {}
+        },
+        Command::Stop => match session.TryStopAsync().and_then(|op| op.join()) {
+            Ok(false) => eprintln!("[media] la aplicación no aceptó detener"),
+            Err(err) => eprintln!("[media] error al detener: {err}"),
+            Ok(true) => {}
+        },
         Command::SeekBackward => seek_by(session, -SEEK_STEP),
         Command::SeekForward => seek_by(session, SEEK_STEP),
+        Command::SeekTo(target) => seek_to(session, target),
         // Elegir sesión se atiende en el bucle, que es el que sabe a cuál
         // estamos controlando.
         Command::SelectSession(id) => {
             eprintln!("[media] elegir sesión se atiende en el bucle: {id}");
         }
+    }
+}
+
+fn seek_to(session: &GlobalSystemMediaTransportControlsSession, target: i64) {
+    let Ok(timeline) = session.GetTimelineProperties() else {
+        return;
+    };
+
+    let start = timeline.MinSeekTime().map_or(0, |t| t.Duration);
+    let end = timeline.MaxSeekTime().map_or(0, |t| t.Duration);
+
+    let target = if end > start {
+        target.clamp(start, end)
+    } else {
+        target.max(0)
+    };
+
+    match session
+        .TryChangePlaybackPositionAsync(target)
+        .and_then(|op| op.join())
+    {
+        Ok(true) => eprintln!(
+            "[media] posición cambiada a {:.1}s",
+            target as f64 / TICKS_PER_SEC as f64
+        ),
+        Ok(false) => eprintln!("[media] esta aplicación no admite cambiar la posición"),
+        Err(err) => eprintln!("[media] error al cambiar la posición: {err}"),
     }
 }
 

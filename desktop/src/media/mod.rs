@@ -9,9 +9,15 @@ use std::sync::Arc;
 /// Orden que envía la UI al backend.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
-    TogglePlayPause,
+    /// Reproduce (no invierte el estado).
+    Play,
+    /// Pausa (no invierte el estado).
+    Pause,
+    Stop,
     SeekBackward,
     SeekForward,
+    /// Buscar a una posición absoluta, en ticks de 100 ns.
+    SeekTo(i64),
     /// Elegir qué sesión de medios controlar.
     SelectSession(String),
 }

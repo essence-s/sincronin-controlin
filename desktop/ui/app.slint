@@ -1,3 +1,5 @@
+import { Slider } from "std-widgets.slint";
+
 // Campo de texto.
 //
 // Es un `TextInput` a pelo, no el `LineEdit` de los widgets estándar: con
@@ -226,6 +228,7 @@ export component AppWindow inherits Window {
     callback toggle-play-pause();
     callback seek-backward();
     callback seek-forward();
+    callback seek-to(float);
     callback select-session(string);
     callback connect(string);
     callback disconnect();
@@ -444,6 +447,20 @@ export component AppWindow inherits Window {
                                 clicked => { root.select-session(session.id); }
                             }
                         }
+
+                        // Línea de progreso: un slider para buscar posición,
+                        // y un riel de referencia ligero debajo.
+                        Slider {
+                            // x: 18px;
+                            // y: parent.height - 24px;
+                            width: 100%;
+                            height: 22px;
+                            minimum: 0.0;
+                            maximum: root.duration-secs * 1.0;
+                            value: root.position-secs * 1.0;
+                            enabled: root.has-session && root.can-seek;
+                            released => { root.seek-to(self.value); }
+                        }
                     }
 
                     HorizontalLayout {
@@ -490,33 +507,6 @@ export component AppWindow inherits Window {
                             clicked => { root.quit(); }
                         }
                     }
-                }
-
-                // Línea de progreso: riel y relleno como hermanos, para que las
-                // posiciones sean inequívocas.
-                //
-                // El ancho deja lugar para los cinco botones de la derecha
-                // (34 px cada uno, más 4 px de separación) y los márgenes.
-                Rectangle {
-                    x: 18px;
-                    y: parent.height - 9px;
-                    width: parent.width - 226px;
-                    height: 3px;
-                    border-radius: 1.5px;
-                    background: #ffffff1c;
-                }
-
-                Rectangle {
-                    x: 18px;
-                    y: parent.height - 9px;
-                    height: 3px;
-                    border-radius: 1.5px;
-                    background: #7c7cff;
-                    width: root.duration-secs > 0
-                        ? min(
-                            (root.position-secs * (parent.width - 226px)) / root.duration-secs,
-                            parent.width - 226px)
-                        : 0px;
                 }
             }
         }

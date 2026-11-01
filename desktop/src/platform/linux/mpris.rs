@@ -238,9 +238,19 @@ fn handle(
         let mut outcome = Outcome::Keep;
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                Command::TogglePlayPause => {
-                    if let Err(err) = player.play_pause() {
-                        eprintln!("[media] play/pausa falló: {err}");
+                Command::Play => {
+                    if let Err(err) = player.play() {
+                        eprintln!("[media] reproducir falló: {err}");
+                    }
+                }
+                Command::Pause => {
+                    if let Err(err) = player.pause() {
+                        eprintln!("[media] pausa falló: {err}");
+                    }
+                }
+                Command::Stop => {
+                    if let Err(err) = player.stop() {
+                        eprintln!("[media] detener falló: {err}");
                     }
                 }
                 Command::SeekBackward => {
@@ -251,6 +261,12 @@ fn handle(
                 Command::SeekForward => {
                     if let Err(err) = player.seek(SEEK_STEP_US) {
                         eprintln!("[media] avanzar falló: {err}");
+                    }
+                }
+                Command::SeekTo(ticks) => {
+                    let us = ticks / 10;
+                    if let Err(err) = player.seek(us) {
+                        eprintln!("[media] buscar falló: {err}");
                     }
                 }
                 Command::SelectSession(id) => {

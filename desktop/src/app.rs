@@ -31,11 +31,24 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // Canal UI -> backend (comandos).
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
 
+    // Si el cliente ya está en una sala. Sirve para no salir de ella al
+    // abrir el panel.
+    let in_room = Arc::new(AtomicBool::new(false));
+
+    // Si el cliente es el controlador de la sala. Se fija al recibir el
+    // rol del servidor y se usa para habilitar o deshabilitar los
+    // controles de reproducción en la UI.
+    let is_controlador = Arc::new(AtomicBool::new(false));
+
     // Backend -> UI: cada evento del sistema publica una fotografía nueva.
     let sink: Sink = {
         let weak = ui.as_weak();
+        let is_controlador = Arc::clone(&is_controlador);
         std::sync::Arc::new(move |snapshot: Snapshot| {
-            let _ = weak.upgrade_in_event_loop(move |ui| apply(&ui, &snapshot));
+            let is_controlador = Arc::clone(&is_controlador);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                apply(&ui, &snapshot, is_controlador.load(Ordering::Relaxed));
+            });
         })
     };
 
@@ -45,16 +58,16 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // los de medios.
     let (net_cmd_tx, net_cmd_rx) = unbounded::<net::Command>();
 
-    // Si el cliente ya está en una sala. Sirve para no salir de ella al
-    // abrir el panel.
-    let in_room = Arc::new(AtomicBool::new(false));
-
     let net_sink: net::Sink = {
         let weak = ui.as_weak();
         let in_room = Arc::clone(&in_room);
+        let is_controlador = Arc::clone(&is_controlador);
         Arc::new(move |event: net::Event| {
             let in_room = Arc::clone(&in_room);
-            let _ = weak.upgrade_in_event_loop(move |ui| apply_net(&ui, &event, &in_room));
+            let is_controlador = Arc::clone(&is_controlador);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                apply_net(&ui, &event, &in_room, &is_controlador);
+            });
         })
     };
 
@@ -162,11 +175,20 @@ pub fn run() -> Result<(), slint::PlatformError> {
 ///
 /// Se llama en el hilo de la UI, así que puede tocar el modelo de sesiones:
 /// los modelos de Slint usan `Rc` y no se pueden mandar a otro hilo.
-fn apply(ui: &AppWindow, snapshot: &Snapshot) {
+fn apply(ui: &AppWindow, snapshot: &Snapshot, is_controlador: bool) {
     ui.set_has_session(snapshot.has_session);
     ui.set_playing(snapshot.state == PlaybackState::Playing);
-    ui.set_can_toggle(snapshot.can_toggle);
-    ui.set_can_seek(snapshot.can_seek);
+    let (can_toggle, can_seek) = media_controls_gated(
+        if is_controlador {
+            net::Role::Controlador
+        } else {
+            net::Role::Controlado
+        },
+        snapshot.can_toggle,
+        snapshot.can_seek,
+    );
+    ui.set_can_toggle(can_toggle);
+    ui.set_can_seek(can_seek);
 
     let titulo = if !snapshot.has_session {
         "Sin reproducción".to_string()
@@ -231,7 +253,12 @@ fn segundos(ticks: i64) -> i32 {
 }
 
 /// Vuelca un evento de la red en el panel de emparejamiento.
-fn apply_net(ui: &AppWindow, event: &net::Event, in_room: &AtomicBool) {
+fn apply_net(
+    ui: &AppWindow,
+    event: &net::Event,
+    in_room: &AtomicBool,
+    is_controlador: &AtomicBool,
+) {
     match event {
         net::Event::State(state) => {
             in_room.store(*state != net::NetState::Desconectado, Ordering::Relaxed);
@@ -250,6 +277,7 @@ fn apply_net(ui: &AppWindow, event: &net::Event, in_room: &AtomicBool) {
                 net::Role::Controlador => "controlador",
             };
             ui.set_role_text(texto.into());
+            is_controlador.store(*role == net::Role::Controlador, Ordering::Relaxed);
         }
     }
 }
@@ -268,4 +296,35 @@ fn append_log(ui: &AppWindow, line: &str) {
     }
 
     ui.set_log_text(lines.join("\n").into());
+}
+
+fn media_controls_gated(role: net::Role, can_toggle: bool, can_seek: bool) -> (bool, bool) {
+    if role == net::Role::Controlado {
+        (false, false)
+    } else {
+        (can_toggle, can_seek)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controlado_disables_media_controls() {
+        let (toggle, seek) = media_controls_gated(net::Role::Controlado, true, true);
+        assert_eq!((toggle, seek), (false, false));
+    }
+
+    #[test]
+    fn controlador_enables_media_controls_when_session() {
+        let (toggle, seek) = media_controls_gated(net::Role::Controlador, true, true);
+        assert_eq!((toggle, seek), (true, true));
+    }
+
+    #[test]
+    fn controlador_disables_media_controls_when_no_session() {
+        let (toggle, seek) = media_controls_gated(net::Role::Controlador, false, false);
+        assert_eq!((toggle, seek), (false, false));
+    }
 }

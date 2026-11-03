@@ -32,6 +32,31 @@ const STATE_INTERVAL: Duration = Duration::from_secs(1);
 /// Tolerancia para distinguir un seek de un avance normal de reproducción.
 const SEEK_TOLERANCE_TICKS: i64 = 10_000_000;
 
+/// Periodo de gracia tras el cual un comando remoto pendiente se descarta
+/// aunque no llegue el evento local coincidente.
+const ECHO_GRACE_PERIOD: Duration = Duration::from_millis(300);
+
+/// Comando remoto aplicado localmente, pendiente de correlación con el
+/// evento local que genera para suprimir su eco.
+struct PendingCommand {
+    action: String,
+    target_ticks: Option<i64>,
+    received_at: Instant,
+}
+
+/// Decide si un snapshot local es el eco de un comando remoto pendiente.
+fn is_echo(pending: &PendingCommand, snapshot: &Snapshot) -> bool {
+    let Some(target) = pending.target_ticks else {
+        return false;
+    };
+    pending.action == "seek_to" && snapshot.position_ticks == target
+}
+
+/// Decide si un comando pendiente ya expiró por periodo de gracia.
+fn is_expired(pending: &PendingCommand, now: Instant) -> bool {
+    now >= pending.received_at + ECHO_GRACE_PERIOD
+}
+
 pub fn run() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
 
@@ -69,6 +94,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // Posición interpolada del controlado, persistente entre mensajes de red.
     let remote_position = Arc::new(Mutex::new(None::<RemotePosition>));
 
+    // Comando remoto aplicado localmente, pendiente de correlación con el
+    // evento local que genera para suprimir su eco.
+    let pending_command = Arc::new(Mutex::new(None::<PendingCommand>));
+
     // Backend -> UI: cada evento del sistema publica una fotografía nueva.
     let sink: Sink = {
         let weak = ui.as_weak();
@@ -78,18 +107,41 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let state_publisher = Arc::clone(&state_publisher);
         let remote_active = Arc::clone(&remote_active);
         let net_cmd_tx = net_cmd_tx.clone();
+        let pending_command = Arc::clone(&pending_command);
         std::sync::Arc::new(move |snapshot: Snapshot| {
             *last_snapshot.lock().expect("el cache no está poisoned") = snapshot.clone();
 
             // El controlado publica su estado mientras haya un controlador
             // conectado, pero la posición se limita en frecuencia.
             if !is_controlador.load(Ordering::Relaxed) && connected.load(Ordering::Relaxed) {
-                let publish = state_publisher
+                let now = Instant::now();
+                let mut pending = pending_command
                     .lock()
-                    .expect("el publicador no está poisoned")
-                    .should_publish(&snapshot, Instant::now());
-                if publish {
-                    let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
+                    .expect("el comando pendiente no está poisoned");
+                let is_echo = pending
+                    .as_ref()
+                    .is_some_and(|p| is_echo(p, &snapshot));
+                if is_echo {
+                    // Es el eco del comando remoto: no se publica y se descarta.
+                    *pending = None;
+                } else if pending.as_ref().is_some_and(|p| is_expired(p, now)) {
+                    // El comando pendiente expiró: se descarta y se publica el evento legítimo.
+                    *pending = None;
+                    let publish = state_publisher
+                        .lock()
+                        .expect("el publicador no está poisoned")
+                        .should_publish(&snapshot, now);
+                    if publish {
+                        let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
+                    }
+                } else {
+                    let publish = state_publisher
+                        .lock()
+                        .expect("el publicador no está poisoned")
+                        .should_publish(&snapshot, now);
+                    if publish {
+                        let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
+                    }
                 }
             }
 
@@ -123,6 +175,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let media_tx = media_tx.clone();
         let net_cmd_tx = net_cmd_tx.clone();
         let remote_position = Arc::clone(&remote_position);
+        let pending_command = Arc::clone(&pending_command);
         Arc::new(move |event: net::Event| {
             if let net::Event::State(state) = &event {
                 connected.store(*state == net::NetState::Conectado, Ordering::Relaxed);
@@ -150,6 +203,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let remote_active = Arc::clone(&remote_active);
             let last_snapshot = Arc::clone(&last_snapshot);
             let remote_position = Arc::clone(&remote_position);
+            let pending_command = Arc::clone(&pending_command);
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 apply_net(
                     &ui,
@@ -160,6 +214,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     &remote_active,
                     &last_snapshot,
                     &remote_position,
+                    &pending_command,
                 );
             });
         })
@@ -423,6 +478,7 @@ fn apply_net(
     remote_active: &AtomicBool,
     last_snapshot: &Mutex<Snapshot>,
     remote_position: &Mutex<Option<RemotePosition>>,
+    pending_command: &Mutex<Option<PendingCommand>>,
 ) {
     match event {
         net::Event::State(state) => {
@@ -444,6 +500,49 @@ fn apply_net(
             // Los comandos se ejecutan en el reproductor local: es el
             // controlado aplicando lo que el controlador le envió.
             Incoming::Command(cmd) => {
+                // Registra el comando como pendiente para suprimir su eco
+                // cuando llegue el evento local resultante.
+                let now = Instant::now();
+                let pending = match &cmd {
+                    Command::Play => PendingCommand {
+                        action: "play".to_string(),
+                        target_ticks: None,
+                        received_at: now,
+                    },
+                    Command::Pause => PendingCommand {
+                        action: "pause".to_string(),
+                        target_ticks: None,
+                        received_at: now,
+                    },
+                    Command::Stop => PendingCommand {
+                        action: "stop".to_string(),
+                        target_ticks: None,
+                        received_at: now,
+                    },
+                    Command::SeekBackward => PendingCommand {
+                        action: "seek_backward".to_string(),
+                        target_ticks: None,
+                        received_at: now,
+                    },
+                    Command::SeekForward => PendingCommand {
+                        action: "seek_forward".to_string(),
+                        target_ticks: None,
+                        received_at: now,
+                    },
+                    Command::SeekTo(ticks) => PendingCommand {
+                        action: "seek_to".to_string(),
+                        target_ticks: Some(*ticks),
+                        received_at: now,
+                    },
+                    Command::SelectSession(_) => PendingCommand {
+                        action: "select_session".to_string(),
+                        target_ticks: None,
+                        received_at: now,
+                    },
+                };
+                *pending_command
+                    .lock()
+                    .expect("el comando pendiente no está poisoned") = Some(pending);
                 let _ = media_tx.send(cmd);
             }
             // El estado remoto solo se pinta en el controlador. Un
@@ -1014,5 +1113,54 @@ mod tests {
 
         assert!(!publisher.should_publish(&playing(1_000_000), start + Duration::from_millis(100)));
         assert!(publisher.should_publish(&playing(10_000_000), start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn seek_to_echo_is_suppressed() {
+        let start = Instant::now();
+        let pending = PendingCommand {
+            action: "seek_to".to_string(),
+            target_ticks: Some(125_000_000),
+            received_at: start,
+        };
+        let snapshot = Snapshot {
+            has_session: true,
+            position_ticks: 125_000_000,
+            state: PlaybackState::Playing,
+            ..Snapshot::no_session()
+        };
+
+        assert!(is_echo(&pending, &snapshot));
+    }
+
+    #[test]
+    fn non_matching_local_event_is_published() {
+        let start = Instant::now();
+        let pending = PendingCommand {
+            action: "play".to_string(),
+            target_ticks: None,
+            received_at: start,
+        };
+        let snapshot = Snapshot {
+            has_session: true,
+            position_ticks: 5_000_000,
+            state: PlaybackState::Paused,
+            ..Snapshot::no_session()
+        };
+
+        assert!(!is_echo(&pending, &snapshot));
+    }
+
+    #[test]
+    fn pending_command_expires_after_grace_period() {
+        let start = Instant::now();
+        let pending = PendingCommand {
+            action: "play".to_string(),
+            target_ticks: None,
+            received_at: start,
+        };
+
+        assert!(!is_expired(&pending, start + Duration::from_millis(100)));
+        assert!(is_expired(&pending, start + ECHO_GRACE_PERIOD + Duration::from_millis(1)));
     }
 }

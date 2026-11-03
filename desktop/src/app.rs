@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, unbounded};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -24,6 +25,12 @@ const MAX_LOG_LINES: usize = 40;
 
 /// El mensaje de prueba que manda el botón.
 const TEST_MESSAGE: &str = "hola";
+
+/// Intervalo mínimo entre publicaciones de posición por red.
+const STATE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Tolerancia para distinguir un seek de un avance normal de reproducción.
+const SEEK_TOLERANCE_TICKS: i64 = 10_000_000;
 
 pub fn run() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
@@ -52,6 +59,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // porque el backend de Windows no publica si no hay un evento.
     let last_snapshot = Arc::new(Mutex::new(Snapshot::no_session()));
 
+    // Filtra las publicaciones de estado para no mandar posición a 10 Hz.
+    let state_publisher = Arc::new(Mutex::new(StatePublisher::new()));
+
     // Si el controlador está mostrando el estado del controlado. Mientras
     // tanto, las fotos de su propio reproductor no pisan la UI.
     let remote_active = Arc::new(AtomicBool::new(false));
@@ -62,15 +72,22 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let is_controlador = Arc::clone(&is_controlador);
         let connected = Arc::clone(&connected);
         let last_snapshot = Arc::clone(&last_snapshot);
+        let state_publisher = Arc::clone(&state_publisher);
         let remote_active = Arc::clone(&remote_active);
         let net_cmd_tx = net_cmd_tx.clone();
         std::sync::Arc::new(move |snapshot: Snapshot| {
             *last_snapshot.lock().expect("el cache no está poisoned") = snapshot.clone();
 
             // El controlado publica su estado mientras haya un controlador
-            // conectado.
+            // conectado, pero la posición se limita en frecuencia.
             if !is_controlador.load(Ordering::Relaxed) && connected.load(Ordering::Relaxed) {
-                let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
+                let publish = state_publisher
+                    .lock()
+                    .expect("el publicador no está poisoned")
+                    .should_publish(&snapshot, Instant::now());
+                if publish {
+                    let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
+                }
             }
 
             let is_controlador = Arc::clone(&is_controlador);
@@ -98,6 +115,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let is_controlador = Arc::clone(&is_controlador);
         let connected = Arc::clone(&connected);
         let last_snapshot = Arc::clone(&last_snapshot);
+        let state_publisher = Arc::clone(&state_publisher);
         let remote_active = Arc::clone(&remote_active);
         let media_tx = media_tx.clone();
         let net_cmd_tx = net_cmd_tx.clone();
@@ -114,6 +132,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         .lock()
                         .expect("el cache no está poisoned")
                         .clone();
+                    state_publisher
+                        .lock()
+                        .expect("el publicador no está poisoned")
+                        .reset(&snapshot, Instant::now());
                     let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
                 }
             }
@@ -453,6 +475,81 @@ fn parse_media_command(text: &str) -> Option<crate::media::Command> {
     }
 }
 
+/// Decide cuándo el controlado publica cada snapshot por la red.
+struct StatePublisher {
+    last_observed: Option<(Snapshot, Instant)>,
+    last_sent: Option<Instant>,
+}
+
+impl StatePublisher {
+    fn new() -> Self {
+        Self {
+            last_observed: None,
+            last_sent: None,
+        }
+    }
+
+    /// Marca una foto como enviada sin pasar por el filtro.
+    ///
+    /// Se usa al abrirse el canal, cuando el controlado manda la última foto
+    /// cacheada: el siguiente snapshot de posición no tiene que salir de
+    /// inmediato.
+    fn reset(&mut self, snapshot: &Snapshot, now: Instant) {
+        self.last_observed = Some((snapshot.clone(), now));
+        self.last_sent = Some(now);
+    }
+
+    fn should_publish(&mut self, snapshot: &Snapshot, now: Instant) -> bool {
+        let previous = self.last_observed.take();
+        let (discrete, seek) = match previous {
+            Some((previous, observed_at)) => (
+                is_discrete_change(&previous, snapshot),
+                is_seek(&previous, observed_at, snapshot, now),
+            ),
+            None => (true, false),
+        };
+        self.last_observed = Some((snapshot.clone(), now));
+
+        let due = snapshot.state == PlaybackState::Playing
+            && self
+                .last_sent
+                .is_none_or(|last| now.saturating_duration_since(last) >= STATE_INTERVAL);
+        let publish = discrete || seek || due;
+
+        if publish {
+            self.last_sent = Some(now);
+        }
+
+        publish
+    }
+}
+
+/// Campos del estado que no cambian con solo avanzar la posición.
+fn is_discrete_change(previous: &Snapshot, current: &Snapshot) -> bool {
+    previous.has_session != current.has_session
+        || previous.title != current.title
+        || previous.artist != current.artist
+        || previous.state != current.state
+        || previous.duration_ticks != current.duration_ticks
+}
+
+/// Detecta un salto de posición que no explica el avance normal.
+fn is_seek(previous: &Snapshot, observed_at: Instant, current: &Snapshot, now: Instant) -> bool {
+    if !previous.has_session || !current.has_session {
+        return false;
+    }
+
+    let elapsed = now.saturating_duration_since(observed_at);
+    let advanced = if previous.state == PlaybackState::Playing {
+        (elapsed.as_secs_f64() * 10_000_000.0).round() as i64
+    } else {
+        0
+    };
+    let expected = previous.position_ticks.saturating_add(advanced);
+
+    current.position_ticks.abs_diff(expected) > SEEK_TOLERANCE_TICKS as u64
+}
+
 /// Estado que el controlado publica por el canal de datos.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteState {
@@ -654,5 +751,100 @@ mod tests {
         assert_eq!(remote.artist, "");
         assert_eq!(remote.position_ticks, 0);
         assert_eq!(remote.duration_ticks, 0);
+    }
+
+    fn playing(position_ticks: i64) -> Snapshot {
+        Snapshot {
+            has_session: true,
+            title: "Canción".to_string(),
+            artist: "Artista".to_string(),
+            state: PlaybackState::Playing,
+            position_ticks,
+            duration_ticks: 100_000_000,
+            ..Snapshot::no_session()
+        }
+    }
+
+    #[test]
+    fn position_updates_are_published_at_most_once_per_second() {
+        let mut publisher = StatePublisher::new();
+        let start = Instant::now();
+
+        assert!(publisher.should_publish(&playing(0), start));
+        assert!(!publisher.should_publish(&playing(1_000_000), start + Duration::from_millis(100)));
+        assert!(!publisher.should_publish(&playing(9_000_000), start + Duration::from_millis(900)));
+        assert!(publisher.should_publish(&playing(10_000_000), start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn discrete_changes_are_published_immediately() {
+        let mut publisher = StatePublisher::new();
+        let start = Instant::now();
+        let base = playing(0);
+        assert!(publisher.should_publish(&base, start));
+
+        let mut changed = base.clone();
+        changed.title = "Otra canción".to_string();
+        assert!(publisher.should_publish(&changed, start + Duration::from_millis(100)));
+
+        let mut changed = changed.clone();
+        changed.artist = "Otro artista".to_string();
+        assert!(publisher.should_publish(&changed, start + Duration::from_millis(200)));
+
+        let mut changed = changed.clone();
+        changed.state = PlaybackState::Paused;
+        assert!(publisher.should_publish(&changed, start + Duration::from_millis(300)));
+
+        let mut changed = changed.clone();
+        changed.duration_ticks += 10_000_000;
+        assert!(publisher.should_publish(&changed, start + Duration::from_millis(400)));
+
+        let mut changed = changed.clone();
+        changed.has_session = false;
+        assert!(publisher.should_publish(&changed, start + Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn seeks_are_published_immediately() {
+        let mut publisher = StatePublisher::new();
+        let start = Instant::now();
+        assert!(publisher.should_publish(&playing(0), start));
+
+        assert!(publisher.should_publish(
+            &playing(30 * 10_000_000),
+            start + Duration::from_millis(100)
+        ));
+        assert!(
+            publisher.should_publish(&playing(5 * 10_000_000), start + Duration::from_millis(200))
+        );
+    }
+
+    #[test]
+    fn paused_playback_does_not_publish_position_updates() {
+        let mut publisher = StatePublisher::new();
+        let start = Instant::now();
+        let paused = Snapshot {
+            has_session: true,
+            state: PlaybackState::Paused,
+            position_ticks: 5_000_000,
+            ..Snapshot::no_session()
+        };
+
+        assert!(publisher.should_publish(&paused, start));
+        assert!(!publisher.should_publish(&paused, start + Duration::from_millis(100)));
+        assert!(!publisher.should_publish(&paused, start + Duration::from_secs(1)));
+        assert!(!publisher.should_publish(&paused, start + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn cached_snapshot_on_connect_starts_the_window() {
+        let mut publisher = StatePublisher::new();
+        let start = Instant::now();
+        let cached = playing(0);
+
+        publisher.reset(&cached, start);
+
+        assert!(!publisher.should_publish(&playing(1_000_000), start + Duration::from_millis(100)));
+        assert!(publisher.should_publish(&playing(10_000_000), start + Duration::from_secs(1)));
     }
 }

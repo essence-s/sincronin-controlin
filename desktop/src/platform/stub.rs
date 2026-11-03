@@ -38,6 +38,7 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
                     can_seek: true,
                     position_ticks: position,
                     duration_ticks: TOTAL_SECS * TICKS_PER_SEC,
+                    playback_rate: 1.0,
                     // El shim no tiene sesiones reales que elegir.
                     sessions: Vec::new(),
                     session_id: String::new(),

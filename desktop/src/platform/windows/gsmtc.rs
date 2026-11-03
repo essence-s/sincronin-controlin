@@ -469,7 +469,7 @@ fn publish(
         *props_stale = false;
     }
 
-    let (state, can_toggle, can_seek) = read_controls(session);
+    let (state, can_toggle, can_seek, playback_rate) = read_controls(session);
     let (position_ticks, duration_ticks) = read_timeline(session, state);
 
     // El nombre de la app que controlamos: sale de la lista de sesiones.
@@ -489,6 +489,7 @@ fn publish(
         can_seek,
         position_ticks,
         duration_ticks,
+        playback_rate,
         // Todas las sesiones que publica el sistema. Con una sola, la UI no
         // muestra el selector.
         sessions: entries
@@ -504,9 +505,9 @@ fn publish(
 
 fn read_controls(
     session: &GlobalSystemMediaTransportControlsSession,
-) -> (PlaybackState, bool, bool) {
+) -> (PlaybackState, bool, bool, f64) {
     let Ok(info) = session.GetPlaybackInfo() else {
-        return (PlaybackState::Unknown, true, true);
+        return (PlaybackState::Unknown, true, true, 1.0);
     };
 
     let state = match info.PlaybackStatus() {
@@ -527,7 +528,9 @@ fn read_controls(
         can_seek = controls.IsPlaybackPositionEnabled().unwrap_or(true);
     }
 
-    (state, can_toggle, can_seek)
+    let playback_rate = info.PlaybackRate().and_then(|r| r.get()).unwrap_or(1.0);
+
+    (state, can_toggle, can_seek, playback_rate)
 }
 
 fn read_timeline(

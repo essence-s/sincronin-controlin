@@ -65,6 +65,10 @@ pub struct Snapshot {
     /// ya usa ticks de 100 ns; MPRIS usa microsegundos).
     pub position_ticks: i64,
     pub duration_ticks: i64,
+    /// Tasa de reproducción (1.0 = velocidad normal).
+    ///
+    /// Sirve al controlador para interpolar la posición entre estados.
+    pub playback_rate: f64,
     /// Las sesiones de medios disponibles, para que la UI pueda elegir a cuál
     /// controlar.
     ///
@@ -91,6 +95,7 @@ impl Snapshot {
             can_seek: false,
             position_ticks: 0,
             duration_ticks: 0,
+            playback_rate: 1.0,
             sessions: Vec::new(),
             session_id: String::new(),
         }

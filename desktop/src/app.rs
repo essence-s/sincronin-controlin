@@ -66,6 +66,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // tanto, las fotos de su propio reproductor no pisan la UI.
     let remote_active = Arc::new(AtomicBool::new(false));
 
+    // Posición interpolada del controlado, persistente entre mensajes de red.
+    let remote_position = Arc::new(Mutex::new(None::<RemotePosition>));
+
     // Backend -> UI: cada evento del sistema publica una fotografía nueva.
     let sink: Sink = {
         let weak = ui.as_weak();
@@ -119,6 +122,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let remote_active = Arc::clone(&remote_active);
         let media_tx = media_tx.clone();
         let net_cmd_tx = net_cmd_tx.clone();
+        let remote_position = Arc::clone(&remote_position);
         Arc::new(move |event: net::Event| {
             if let net::Event::State(state) = &event {
                 connected.store(*state == net::NetState::Conectado, Ordering::Relaxed);
@@ -145,6 +149,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             let media_tx = media_tx.clone();
             let remote_active = Arc::clone(&remote_active);
             let last_snapshot = Arc::clone(&last_snapshot);
+            let remote_position = Arc::clone(&remote_position);
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 apply_net(
                     &ui,
@@ -154,6 +159,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     &media_tx,
                     &remote_active,
                     &last_snapshot,
+                    &remote_position,
                 );
             });
         })
@@ -356,8 +362,39 @@ fn segundos(ticks: i64) -> i32 {
 /// Vuelca el estado que publica el controlado en la UI del controlador.
 ///
 /// No toca las sesiones ni los controles: el selector y los botones siguen
-/// siendo los del reproductor local del controlador.
-fn apply_remote(ui: &AppWindow, state: &RemoteState) {
+/// siendo los del reproductor local del controlador. La posición se interpola
+/// con [`RemotePosition`] para que la barra avance suavemente entre mensajes
+/// de red en lugar de saltar a cada foto.
+fn apply_remote(
+    ui: &AppWindow,
+    state: &RemoteState,
+    remote_position: &Mutex<Option<RemotePosition>>,
+) {
+    let now = Instant::now();
+    let mut rp = remote_position
+        .lock()
+        .expect("el interpolador remoto no está poisoned");
+    let position_ticks = match rp.as_mut() {
+        Some(pos) => {
+            pos.update(
+                state.position_ticks,
+                state.playback_rate,
+                state.playback,
+                now,
+            );
+            pos.position(now)
+        }
+        None => {
+            *rp = Some(RemotePosition::new(
+                state.position_ticks,
+                state.playback_rate,
+                state.playback,
+                now,
+            ));
+            state.position_ticks
+        }
+    };
+
     ui.set_has_session(state.has_session);
     ui.set_playing(state.playback == PlaybackState::Playing);
 
@@ -371,11 +408,12 @@ fn apply_remote(ui: &AppWindow, state: &RemoteState) {
     ui.set_track_title(titulo.into());
     ui.set_track_artist(state.artist.clone().into());
 
-    ui.set_position_secs(segundos(state.position_ticks));
+    ui.set_position_secs(segundos(position_ticks));
     ui.set_duration_secs(segundos(state.duration_ticks));
 }
 
 /// Vuelca un evento de la red en el panel de emparejamiento.
+#[allow(clippy::too_many_arguments)]
 fn apply_net(
     ui: &AppWindow,
     event: &net::Event,
@@ -384,6 +422,7 @@ fn apply_net(
     media_tx: &Sender<Command>,
     remote_active: &AtomicBool,
     last_snapshot: &Mutex<Snapshot>,
+    remote_position: &Mutex<Option<RemotePosition>>,
 ) {
     match event {
         net::Event::State(state) => {
@@ -412,7 +451,7 @@ fn apply_net(
             Incoming::State(state) => {
                 if is_controlador.load(Ordering::Relaxed) {
                     remote_active.store(true, Ordering::Relaxed);
-                    apply_remote(ui, &state);
+                    apply_remote(ui, &state, remote_position);
                 }
             }
             Incoming::Ignored => append_log(ui, &format!("← {text}")),
@@ -531,6 +570,7 @@ fn is_discrete_change(previous: &Snapshot, current: &Snapshot) -> bool {
         || previous.artist != current.artist
         || previous.state != current.state
         || previous.duration_ticks != current.duration_ticks
+        || (previous.playback_rate - current.playback_rate).abs() > f64::EPSILON
 }
 
 /// Detecta un salto de posición que no explica el avance normal.
@@ -550,13 +590,63 @@ fn is_seek(previous: &Snapshot, observed_at: Instant, current: &Snapshot, now: I
     current.position_ticks.abs_diff(expected) > SEEK_TOLERANCE_TICKS as u64
 }
 
+/// Interpola la posición remota para la barra de progreso del controlador.
+///
+/// Solo avanza cuando el estado es `Playing`; en pausa o detenido se congela.
+/// Cada estado nuevo reemplaza el ancla y la tasa, así que seek, cambio de
+/// pista y cambio de velocidad se resincronizan de inmediato.
+struct RemotePosition {
+    position_ticks: i64,
+    playback_rate: f64,
+    state: PlaybackState,
+    anchor_at: Instant,
+}
+
+impl RemotePosition {
+    fn new(position_ticks: i64, playback_rate: f64, state: PlaybackState, now: Instant) -> Self {
+        Self {
+            position_ticks,
+            playback_rate,
+            state,
+            anchor_at: now,
+        }
+    }
+
+    fn update(
+        &mut self,
+        position_ticks: i64,
+        playback_rate: f64,
+        state: PlaybackState,
+        now: Instant,
+    ) {
+        self.position_ticks = position_ticks;
+        self.playback_rate = playback_rate;
+        self.state = state;
+        self.anchor_at = now;
+    }
+
+    /// Posición interpolada en `now`, en ticks.
+    fn position(&self, now: Instant) -> i64 {
+        let anchor = self.position_ticks.max(0);
+        if self.state == PlaybackState::Playing {
+            let elapsed = now.saturating_duration_since(self.anchor_at);
+            let advanced =
+                (elapsed.as_secs_f64() * self.playback_rate * 10_000_000.0).round() as i64;
+            anchor.saturating_add(advanced)
+        } else {
+            anchor
+        }
+    }
+}
+
 /// Estado que el controlado publica por el canal de datos.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct RemoteState {
     has_session: bool,
     playback: PlaybackState,
     position_ticks: i64,
     duration_ticks: i64,
+    playback_rate: f64,
     title: String,
     artist: String,
 }
@@ -576,6 +666,7 @@ fn state_message(snapshot: &Snapshot) -> String {
         "playback_status": playback,
         "position_ms": snapshot.position_ticks / 10_000,
         "duration_ms": snapshot.duration_ticks / 10_000,
+        "playback_rate": snapshot.playback_rate,
         "title": &snapshot.title,
         "artist": &snapshot.artist,
     })
@@ -601,6 +692,10 @@ fn parse_state_message(text: &str) -> Option<RemoteState> {
         playback,
         position_ticks: value.get("position_ms")?.as_i64()?.saturating_mul(10_000),
         duration_ticks: value.get("duration_ms")?.as_i64()?.saturating_mul(10_000),
+        playback_rate: value
+            .get("playback_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0),
         title: value.get("title")?.as_str()?.to_string(),
         artist: value.get("artist")?.as_str()?.to_string(),
     })
@@ -717,6 +812,79 @@ mod tests {
         let remote = parse_state_message(&text).expect("el estado se entiende");
         assert_eq!(remote.position_ticks, 1_250_000_000);
         assert_eq!(remote.duration_ticks, 36_000_000_000);
+    }
+
+    #[test]
+    fn state_message_carries_the_playback_rate() {
+        let snapshot = Snapshot {
+            playback_rate: 1.25,
+            ..playing(0)
+        };
+
+        let text = state_message(&snapshot);
+        let remote = parse_state_message(&text).expect("el estado se entiende");
+
+        assert_eq!(remote.playback_rate, 1.25);
+    }
+
+    #[test]
+    fn remote_position_advances_with_the_playback_rate() {
+        let start = Instant::now();
+        let position = RemotePosition::new(0, 1.5, PlaybackState::Playing, start);
+
+        let advanced = position.position(start + Duration::from_secs(2));
+        assert_eq!(advanced, 3 * 10_000_000);
+    }
+
+    #[test]
+    fn remote_position_does_not_advance_when_not_playing() {
+        let start = Instant::now();
+        let position = RemotePosition::new(5_000_000, 1.0, PlaybackState::Paused, start);
+
+        assert_eq!(
+            position.position(start + Duration::from_secs(2)),
+            5_000_000
+        );
+    }
+
+    #[test]
+    fn a_new_remote_state_reanchors_the_position() {
+        let start = Instant::now();
+        let mut position = RemotePosition::new(0, 1.0, PlaybackState::Playing, start);
+        position.update(
+            30_000_000,
+            1.0,
+            PlaybackState::Playing,
+            start + Duration::from_millis(100),
+        );
+
+        // Justo después del reanclaje, la posición es el valor anclado.
+        assert_eq!(
+            position.position(start + Duration::from_millis(100)),
+            30_000_000
+        );
+        // Y sigue interpolando desde ese ancla con la tasa nueva.
+        assert_eq!(
+            position.position(start + Duration::from_millis(200)),
+            31_000_000
+        );
+    }
+
+    #[test]
+    fn a_rate_change_counts_as_a_discrete_change() {
+        let mut publisher = StatePublisher::new();
+        let start = Instant::now();
+        let base = Snapshot {
+            playback_rate: 1.0,
+            ..playing(0)
+        };
+        assert!(publisher.should_publish(&base, start));
+
+        let changed = Snapshot {
+            playback_rate: 2.0,
+            ..playing(0)
+        };
+        assert!(publisher.should_publish(&changed, start + Duration::from_millis(100)));
     }
 
     #[test]

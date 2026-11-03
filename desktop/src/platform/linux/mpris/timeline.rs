@@ -229,6 +229,10 @@ impl Timeline {
         self.duration_ticks
     }
 
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
     /// Encaja una posición en el rango válido de la pista.
     pub fn clamp_position(&self, position_ticks: i64) -> i64 {
         let position = position_ticks.max(0);

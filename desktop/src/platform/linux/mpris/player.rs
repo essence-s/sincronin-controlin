@@ -67,6 +67,7 @@ pub fn snapshot(
         can_seek: controls.can_seek,
         position_ticks: timeline.position(now),
         duration_ticks: timeline.duration_ticks(),
+        playback_rate: timeline.rate(),
         sessions: sessions.to_vec(),
         session_id: player.bus_name().to_string(),
     }

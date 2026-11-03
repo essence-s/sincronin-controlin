@@ -135,6 +135,17 @@ fn run(cmd_rx: Receiver<Command>, sink: Sink) -> WinResult<()> {
 
     attach_current(&manager, &entries, &mut watch, &mut controlled_id, &wake_tx)?;
 
+    // Primera foto: el controlado la manda al abrirse el canal. Sin esto,
+    // el cache arrancaría vacío hasta el primer evento del sistema.
+    publish(
+        &sink,
+        watch.as_ref(),
+        &mut cache,
+        &mut props_stale,
+        &entries,
+        controlled_id.as_deref(),
+    );
+
     loop {
         // Aquí el hilo se queda bloqueado: no hay sondeo, solo espera de eventos.
         let evento = crossbeam_channel::select! {

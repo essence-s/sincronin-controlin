@@ -8,8 +8,8 @@
 //! vive en [`media`] y la integración con el sistema en [`platform`]; la
 //! lógica de la red, en [`net`].
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Sender, unbounded};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -31,6 +31,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // Canal UI -> backend (comandos).
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
 
+    // Canales de red. El de comandos se crea antes del sink de medios
+    // porque el controlado publica su estado por ahí.
+    let (net_cmd_tx, net_cmd_rx) = unbounded::<net::Command>();
+
     // Si el cliente ya está en una sala. Sirve para no salir de ella al
     // abrir el panel.
     let in_room = Arc::new(AtomicBool::new(false));
@@ -40,23 +44,48 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // controles de reproducción en la UI.
     let is_controlador = Arc::new(AtomicBool::new(false));
 
+    // Si el canal de datos está abierto. El controlado solo publica estado
+    // cuando hay alguien al otro lado.
+    let connected = Arc::new(AtomicBool::new(false));
+
+    // La última foto del reproductor local. Se manda al abrirse el canal
+    // porque el backend de Windows no publica si no hay un evento.
+    let last_snapshot = Arc::new(Mutex::new(Snapshot::no_session()));
+
+    // Si el controlador está mostrando el estado del controlado. Mientras
+    // tanto, las fotos de su propio reproductor no pisan la UI.
+    let remote_active = Arc::new(AtomicBool::new(false));
+
     // Backend -> UI: cada evento del sistema publica una fotografía nueva.
     let sink: Sink = {
         let weak = ui.as_weak();
         let is_controlador = Arc::clone(&is_controlador);
+        let connected = Arc::clone(&connected);
+        let last_snapshot = Arc::clone(&last_snapshot);
+        let remote_active = Arc::clone(&remote_active);
+        let net_cmd_tx = net_cmd_tx.clone();
         std::sync::Arc::new(move |snapshot: Snapshot| {
+            *last_snapshot.lock().expect("el cache no está poisoned") = snapshot.clone();
+
+            // El controlado publica su estado mientras haya un controlador
+            // conectado.
+            if !is_controlador.load(Ordering::Relaxed) && connected.load(Ordering::Relaxed) {
+                let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
+            }
+
             let is_controlador = Arc::clone(&is_controlador);
+            let remote_active = Arc::clone(&remote_active);
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                apply(&ui, &snapshot, is_controlador.load(Ordering::Relaxed));
+                // Mientras haya estado remoto, el reproductor local del
+                // controlador no manda en la pantalla.
+                if !remote_active.load(Ordering::Relaxed) {
+                    apply(&ui, &snapshot, is_controlador.load(Ordering::Relaxed));
+                }
             });
         })
     };
 
     platform::spawn(cmd_rx, sink);
-
-    // La red tiene su propio canal y su propio sink: no se mezcla con
-    // los de medios.
-    let (net_cmd_tx, net_cmd_rx) = unbounded::<net::Command>();
 
     // El canal de comandos de medios también se usa para ejecutar los
     // mensajes que llegan por el canal de datos (el controlado aplica
@@ -67,13 +96,43 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         let in_room = Arc::clone(&in_room);
         let is_controlador = Arc::clone(&is_controlador);
+        let connected = Arc::clone(&connected);
+        let last_snapshot = Arc::clone(&last_snapshot);
+        let remote_active = Arc::clone(&remote_active);
         let media_tx = media_tx.clone();
+        let net_cmd_tx = net_cmd_tx.clone();
         Arc::new(move |event: net::Event| {
+            if let net::Event::State(state) = &event {
+                connected.store(*state == net::NetState::Conectado, Ordering::Relaxed);
+
+                // El controlado manda su última foto al abrirse el canal.
+                // En Windows el backend solo publica con eventos, así que
+                // sin esto el controlador podría no ver nada hasta el
+                // próximo cambio.
+                if *state == net::NetState::Conectado && !is_controlador.load(Ordering::Relaxed) {
+                    let snapshot = last_snapshot
+                        .lock()
+                        .expect("el cache no está poisoned")
+                        .clone();
+                    let _ = net_cmd_tx.send(net::Command::Send(state_message(&snapshot)));
+                }
+            }
+
             let in_room = Arc::clone(&in_room);
             let is_controlador = Arc::clone(&is_controlador);
             let media_tx = media_tx.clone();
+            let remote_active = Arc::clone(&remote_active);
+            let last_snapshot = Arc::clone(&last_snapshot);
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                apply_net(&ui, &event, &in_room, &is_controlador, &media_tx);
+                apply_net(
+                    &ui,
+                    &event,
+                    &in_room,
+                    &is_controlador,
+                    &media_tx,
+                    &remote_active,
+                    &last_snapshot,
+                );
             });
         })
     };
@@ -272,6 +331,28 @@ fn segundos(ticks: i64) -> i32 {
     i32::try_from(s).unwrap_or(if s > 0 { i32::MAX } else { i32::MIN })
 }
 
+/// Vuelca el estado que publica el controlado en la UI del controlador.
+///
+/// No toca las sesiones ni los controles: el selector y los botones siguen
+/// siendo los del reproductor local del controlador.
+fn apply_remote(ui: &AppWindow, state: &RemoteState) {
+    ui.set_has_session(state.has_session);
+    ui.set_playing(state.playback == PlaybackState::Playing);
+
+    let titulo = if !state.has_session {
+        "Sin reproducción".to_string()
+    } else if state.title.is_empty() {
+        "Desconocido".to_string()
+    } else {
+        state.title.clone()
+    };
+    ui.set_track_title(titulo.into());
+    ui.set_track_artist(state.artist.clone().into());
+
+    ui.set_position_secs(segundos(state.position_ticks));
+    ui.set_duration_secs(segundos(state.duration_ticks));
+}
+
 /// Vuelca un evento de la red en el panel de emparejamiento.
 fn apply_net(
     ui: &AppWindow,
@@ -279,23 +360,41 @@ fn apply_net(
     in_room: &AtomicBool,
     is_controlador: &AtomicBool,
     media_tx: &Sender<Command>,
+    remote_active: &AtomicBool,
+    last_snapshot: &Mutex<Snapshot>,
 ) {
     match event {
         net::Event::State(state) => {
             in_room.store(*state != net::NetState::Desconectado, Ordering::Relaxed);
             ui.set_state_text(state.label().into());
             ui.set_can_send(*state == net::NetState::Conectado);
-        }
-        net::Event::Message(text) => {
-            // Los mensajes que son comandos de medios se ejecutan en el
-            // reproductor local (es el controlado aplicando lo que el
-            // controlador le envió). Lo que no es un comando se registra.
-            if let Some(cmd) = parse_media_command(text) {
-                let _ = media_tx.send(cmd);
-            } else {
-                append_log(ui, &format!("← {text}"));
+
+            // Si se cierra el canal, el estado remoto deja de ser válido:
+            // se vuelve a la reproducción local.
+            if *state != net::NetState::Conectado && remote_active.swap(false, Ordering::Relaxed) {
+                let snapshot = last_snapshot
+                    .lock()
+                    .expect("el cache no está poisoned")
+                    .clone();
+                apply(ui, &snapshot, is_controlador.load(Ordering::Relaxed));
             }
         }
+        net::Event::Message(text) => match route_message(text) {
+            // Los comandos se ejecutan en el reproductor local: es el
+            // controlado aplicando lo que el controlador le envió.
+            Incoming::Command(cmd) => {
+                let _ = media_tx.send(cmd);
+            }
+            // El estado remoto solo se pinta en el controlador. Un
+            // controlado que lo reciba lo ignora.
+            Incoming::State(state) => {
+                if is_controlador.load(Ordering::Relaxed) {
+                    remote_active.store(true, Ordering::Relaxed);
+                    apply_remote(ui, &state);
+                }
+            }
+            Incoming::Ignored => append_log(ui, &format!("← {text}")),
+        },
         net::Event::Notice(text) => {
             append_log(ui, &format!("· {text}"));
         }
@@ -338,7 +437,6 @@ fn media_controls_gated(role: net::Role, can_toggle: bool, can_seek: bool) -> (b
 ///
 /// Solo reconoce comandos simples de un solo comando. Un mensaje que no
 /// sea un comando válido devuelve `None` y se ignora.
-#[allow(dead_code)]
 fn parse_media_command(text: &str) -> Option<crate::media::Command> {
     let text = text.trim();
     match text {
@@ -352,6 +450,81 @@ fn parse_media_command(text: &str) -> Option<crate::media::Command> {
             rest.parse::<i64>().ok().map(crate::media::Command::SeekTo)
         }
         _ => None,
+    }
+}
+
+/// Estado que el controlado publica por el canal de datos.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteState {
+    has_session: bool,
+    playback: PlaybackState,
+    position_ticks: i64,
+    duration_ticks: i64,
+    title: String,
+    artist: String,
+}
+
+/// Arma el mensaje de estado que viaja por el canal de datos.
+fn state_message(snapshot: &Snapshot) -> String {
+    let playback = match snapshot.state {
+        PlaybackState::Playing => "playing",
+        PlaybackState::Paused => "paused",
+        PlaybackState::Stopped => "stopped",
+        PlaybackState::Unknown => "unknown",
+    };
+
+    serde_json::json!({
+        "type": "state",
+        "has_session": snapshot.has_session,
+        "playback_status": playback,
+        "position_ms": snapshot.position_ticks / 10_000,
+        "duration_ms": snapshot.duration_ticks / 10_000,
+        "title": &snapshot.title,
+        "artist": &snapshot.artist,
+    })
+    .to_string()
+}
+
+/// Lee un mensaje de estado. Devuelve `None` si no es un estado válido.
+fn parse_state_message(text: &str) -> Option<RemoteState> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("type")?.as_str()? != "state" {
+        return None;
+    }
+
+    let playback = match value.get("playback_status")?.as_str()? {
+        "playing" => PlaybackState::Playing,
+        "paused" => PlaybackState::Paused,
+        "stopped" => PlaybackState::Stopped,
+        _ => PlaybackState::Unknown,
+    };
+
+    Some(RemoteState {
+        has_session: value.get("has_session")?.as_bool()?,
+        playback,
+        position_ticks: value.get("position_ms")?.as_i64()?.saturating_mul(10_000),
+        duration_ticks: value.get("duration_ms")?.as_i64()?.saturating_mul(10_000),
+        title: value.get("title")?.as_str()?.to_string(),
+        artist: value.get("artist")?.as_str()?.to_string(),
+    })
+}
+
+/// Lo que puede llegar por el canal de datos.
+#[derive(Clone, Debug, PartialEq)]
+enum Incoming {
+    State(RemoteState),
+    Command(Command),
+    Ignored,
+}
+
+/// Clasifica un mensaje del canal de datos.
+fn route_message(text: &str) -> Incoming {
+    if let Some(state) = parse_state_message(text) {
+        Incoming::State(state)
+    } else if let Some(command) = parse_media_command(text) {
+        Incoming::Command(command)
+    } else {
+        Incoming::Ignored
     }
 }
 
@@ -407,5 +580,79 @@ mod tests {
     fn parse_media_command_seek_to() {
         let cmd = parse_media_command("seek_to 125000");
         assert_eq!(cmd, Some(crate::media::Command::SeekTo(125000)));
+    }
+
+    #[test]
+    fn state_message_carries_the_track_and_playback() {
+        let snapshot = Snapshot {
+            has_session: true,
+            title: "Canción".to_string(),
+            artist: "Artista".to_string(),
+            state: PlaybackState::Playing,
+            position_ticks: 1_250_000_000,
+            duration_ticks: 36_000_000_000,
+            ..Snapshot::no_session()
+        };
+
+        let text = state_message(&snapshot);
+        let remote = parse_state_message(&text).expect("el estado se entiende");
+
+        assert!(remote.has_session);
+        assert_eq!(remote.title, "Canción");
+        assert_eq!(remote.artist, "Artista");
+        assert_eq!(remote.playback, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn state_message_carries_the_position_and_duration() {
+        let snapshot = Snapshot {
+            has_session: true,
+            position_ticks: 1_250_000_000,
+            duration_ticks: 36_000_000_000,
+            ..Snapshot::no_session()
+        };
+
+        let text = state_message(&snapshot);
+        let json: serde_json::Value = serde_json::from_str(&text).expect("es JSON");
+        assert_eq!(json["position_ms"].as_i64(), Some(125_000));
+        assert_eq!(json["duration_ms"].as_i64(), Some(3_600_000));
+
+        let remote = parse_state_message(&text).expect("el estado se entiende");
+        assert_eq!(remote.position_ticks, 1_250_000_000);
+        assert_eq!(remote.duration_ticks, 36_000_000_000);
+    }
+
+    #[test]
+    fn state_message_is_not_parsed_as_a_command() {
+        let snapshot = Snapshot {
+            has_session: true,
+            title: "Canción".to_string(),
+            ..Snapshot::no_session()
+        };
+        let text = state_message(&snapshot);
+
+        match route_message(&text) {
+            Incoming::State(state) => assert_eq!(state.title, "Canción"),
+            otro => panic!("el estado no se tiene que tratar como comando: {otro:?}"),
+        }
+
+        match route_message("play") {
+            Incoming::Command(Command::Play) => {}
+            otro => panic!("un comando se sigue tratando como comando: {otro:?}"),
+        }
+
+        assert!(matches!(route_message("hola"), Incoming::Ignored));
+    }
+
+    #[test]
+    fn state_message_reports_when_there_is_no_session() {
+        let text = state_message(&Snapshot::no_session());
+        let remote = parse_state_message(&text).expect("el estado se entiende");
+
+        assert!(!remote.has_session);
+        assert_eq!(remote.title, "");
+        assert_eq!(remote.artist, "");
+        assert_eq!(remote.position_ticks, 0);
+        assert_eq!(remote.duration_ticks, 0);
     }
 }

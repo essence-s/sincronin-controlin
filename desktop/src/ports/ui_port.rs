@@ -11,6 +11,8 @@ pub trait UiPort: Send + Sync + 'static {
     fn set_track_title(&self, title: String);
     /// Artista de la pista actual.
     fn set_track_artist(&self, artist: String);
+    /// Si hay sesión activa.
+    fn set_has_session(&self, has_session: bool);
     /// Si se está reproduciendo.
     fn set_playing(&self, playing: bool);
     /// Posición actual en segundos.

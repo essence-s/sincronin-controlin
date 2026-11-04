@@ -7,3 +7,7 @@
 pub mod media_port;
 pub mod net_port;
 pub mod ui_port;
+
+pub use media_port::MediaPort;
+pub use net_port::NetPort;
+pub use ui_port::UiPort;

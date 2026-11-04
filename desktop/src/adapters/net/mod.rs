@@ -14,14 +14,20 @@ use crate::domain::room::Role as DomainRole;
 
 use crate::net::{self, Command, Event as NetRawEvent, NetState as RawNetState, Role as RawRole};
 
+/// Estado interno compartido para permitir clonar el adaptador.
+struct Inner {
+    cmd_tx: Sender<Command>,
+    events: Arc<Mutex<Vec<NetEvent>>>,
+    rx: Receiver<NetRawEvent>,
+}
+
 /// Adaptador de red.
 ///
 /// Envuelve los hilos de señalización y par existentes, y traduce sus
 /// eventos al dominio.
+#[derive(Clone)]
 pub struct NetAdapter {
-    cmd_tx: Sender<Command>,
-    events: Arc<Mutex<Vec<NetEvent>>>,
-    rx: Receiver<NetRawEvent>,
+    inner: Arc<Inner>,
 }
 
 impl NetAdapter {
@@ -35,18 +41,21 @@ impl NetAdapter {
         net::spawn(cmd_rx, sink);
 
         Self {
-            cmd_tx,
-            events: Arc::new(Mutex::new(Vec::new())),
-            rx: sink_rx,
+            inner: Arc::new(Inner {
+                cmd_tx,
+                events: Arc::new(Mutex::new(Vec::new())),
+                rx: sink_rx,
+            }),
         }
     }
 
     /// Drena los eventos crudos y los traduce al dominio, invocando el
     /// callback para cada uno.
     fn pump_events(&self, callback: &dyn Fn(NetEvent)) {
-        while let Ok(event) = self.rx.try_recv() {
+        while let Ok(event) = self.inner.rx.try_recv() {
             let domain_event = translate(event);
-            self.events
+            self.inner
+                .events
                 .lock()
                 .expect("el registro de eventos no está poisoned")
                 .push(domain_event.clone());
@@ -58,21 +67,21 @@ impl NetAdapter {
 impl NetPort for NetAdapter {
     fn connect(&self, room: Option<String>) {
         let code = room.unwrap_or_else(|| net::local_room_code().to_string());
-        let _ = self.cmd_tx.send(Command::Connect { room: code });
+        let _ = self.inner.cmd_tx.send(Command::Connect { room: code });
     }
 
     fn disconnect(&self) {
-        let _ = self.cmd_tx.send(Command::Disconnect);
+        let _ = self.inner.cmd_tx.send(Command::Disconnect);
     }
 
     fn send_data(&self, text: String) {
-        let _ = self.cmd_tx.send(net::Command::Send(text));
+        let _ = self.inner.cmd_tx.send(net::Command::Send(text));
     }
 
     fn on_event(&self, callback: Box<dyn Fn(NetEvent) + Send + Sync>) {
         let callback = Arc::new(callback);
-        let events = Arc::clone(&self.events);
-        let rx = self.rx.clone();
+        let events = Arc::clone(&self.inner.events);
+        let rx = self.inner.rx.clone();
 
         std::thread::Builder::new()
             .name("net-adapter".to_string())

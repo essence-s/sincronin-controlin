@@ -4,11 +4,12 @@ use crate::ports::MediaPort;
 use crate::domain::media::Command;
 
 /// Servicio de medios: ejecutar comandos en el reproductor local.
-pub struct MediaService<M: MediaPort> {
+#[derive(Clone)]
+pub struct MediaService<M: MediaPort + Clone> {
     media: M,
 }
 
-impl<M: MediaPort> MediaService<M> {
+impl<M: MediaPort + Clone> MediaService<M> {
     /// Crea un nuevo servicio con el puerto de medios inyectado.
     pub fn new(media: M) -> Self {
         Self { media }

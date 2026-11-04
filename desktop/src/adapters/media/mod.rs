@@ -14,13 +14,19 @@ use crate::domain::media::{Command, Snapshot};
 use crate::media::Sink as MediaSink;
 use crate::platform;
 
+/// Estado interno compartido para permitir clonar el adaptador.
+struct Inner {
+    cmd_tx: Sender<Command>,
+    snapshot_cb: Arc<Mutex<Option<Box<dyn Fn(Snapshot) + Send + Sync>>>>,
+}
+
 /// Adaptador de medios.
 ///
 /// Envuelve el hilo de medios existente (GSMTC, MPRIS o stub) y traduce
 /// sus snapshots al dominio.
+#[derive(Clone)]
 pub struct MediaAdapter {
-    cmd_tx: Sender<Command>,
-    snapshot_cb: Arc<Mutex<Option<Box<dyn Fn(Snapshot) + Send + Sync>>>>,
+    inner: Arc<Inner>,
 }
 
 impl MediaAdapter {
@@ -40,19 +46,22 @@ impl MediaAdapter {
         platform::spawn(cmd_rx, sink);
 
         Self {
-            cmd_tx,
-            snapshot_cb,
+            inner: Arc::new(Inner {
+                cmd_tx,
+                snapshot_cb,
+            }),
         }
     }
 }
 
 impl MediaPort for MediaAdapter {
     fn send_command(&self, command: Command) {
-        let _ = self.cmd_tx.send(command);
+        let _ = self.inner.cmd_tx.send(command);
     }
 
     fn on_snapshot(&self, callback: Box<dyn Fn(Snapshot) + Send + Sync>) {
         *self
+            .inner
             .snapshot_cb
             .lock()
             .expect("el callback no está poisoned") = Some(callback);

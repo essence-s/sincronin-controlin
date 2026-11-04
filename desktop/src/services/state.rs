@@ -1,6 +1,6 @@
 //! Caso de uso: publicación de estado, supresión de echo e interpolación.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::ports::{MediaPort, NetPort, UiPort};
@@ -21,10 +21,10 @@ pub struct RemoteState {
 }
 
 /// Servicio de estado: publica estado local, suprime ecos, interpola remoto.
-pub struct StateService<M: MediaPort, N: NetPort, U: UiPort> {
+pub struct StateService<M: MediaPort, N: NetPort> {
     media: M,
     net: N,
-    ui: U,
+    ui: Arc<dyn UiPort>,
     publisher: StatePublisher,
     pending: Mutex<Option<crate::domain::echo::PendingCommand>>,
     remote_position: Mutex<Option<RemotePosition>>,
@@ -107,9 +107,9 @@ fn is_seek(
     current.position_ticks.abs_diff(expected) > SEEK_TOLERANCE_TICKS as u64
 }
 
-impl<M: MediaPort, N: NetPort, U: UiPort> StateService<M, N, U> {
+impl<M: MediaPort, N: NetPort> StateService<M, N> {
     /// Crea un nuevo servicio con los puertos inyectados.
-    pub fn new(media: M, net: N, ui: U) -> Self {
+    pub fn new(media: M, net: N, ui: Arc<dyn UiPort>) -> Self {
         Self {
             media,
             net,

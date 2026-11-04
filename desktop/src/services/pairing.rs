@@ -3,11 +3,12 @@
 use crate::ports::NetPort;
 
 /// Servicio de emparejamiento: entrar/salir de sala y gestionar el rol.
-pub struct PairingService<N: NetPort> {
+#[derive(Clone)]
+pub struct PairingService<N: NetPort + Clone> {
     net: N,
 }
 
-impl<N: NetPort> PairingService<N> {
+impl<N: NetPort + Clone> PairingService<N> {
     /// Crea un nuevo servicio con el puerto de red inyectado.
     pub fn new(net: N) -> Self {
         Self { net }

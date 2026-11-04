@@ -154,32 +154,7 @@ pub(crate) fn run(
         // Si la conexión se corto, se cierra y se sigue escuchando: el
         // usuario puede volver a conectarse cuando el servidor vuelva.
         if let Action::Close(reason) = action {
-            // Si eramos el controlado, la sala no se disuelve: sus
-            // controladores se quedan esperando y se vuelve solo.
-            let mut rejoin = session.rejoin.take();
-            if rejoin.is_none() {
-                rejoin = session.rejoin_intent();
-            }
-
-            net::publish_notice(&sink, reason);
-            session.forget();
-            net::send_peer(&peer_tx, PeerCommand::Stop);
-
-            match rejoin {
-                Some(rejoin) => {
-                    eprintln!(
-                        "[net] se cayó la conexión: vuelvo a la sala {}",
-                        rejoin.room
-                    );
-                    net::publish_state(&sink, NetState::Conectando);
-                    net::publish_notice(
-                        &sink,
-                        "se cayó la conexión: vuelvo a la sala en un momento",
-                    );
-                    session.rejoin = Some(rejoin);
-                }
-                None => net::publish_state(&sink, NetState::Desconectado),
-            }
+            connection_lost(&mut session, reason, &peer_tx, &sink);
         }
     }
 
@@ -188,6 +163,40 @@ pub(crate) fn run(
     net::publish_state(&sink, NetState::Desconectado);
 
     Ok(())
+}
+
+/// Atiende la caída de la conexión con el servidor.
+///
+/// Si eramos el controlado, la sala no se disuelve: sus controladores se
+/// quedan esperando y la vuelta queda armada. Si no, queda desconectado y
+/// listo.
+fn connection_lost(
+    session: &mut Session,
+    reason: String,
+    peer_tx: &Sender<PeerCommand>,
+    sink: &Sink,
+) {
+    let mut rejoin = session.rejoin.take();
+    if rejoin.is_none() {
+        rejoin = session.rejoin_intent();
+    }
+
+    net::publish_notice(sink, reason);
+    session.forget();
+    net::send_peer(peer_tx, PeerCommand::Stop);
+
+    match rejoin {
+        Some(rejoin) => {
+            eprintln!(
+                "[net] se cayó la conexión: vuelvo a la sala {}",
+                rejoin.room
+            );
+            net::publish_state(sink, NetState::Conectando);
+            net::publish_notice(sink, "se cayó la conexión: vuelvo a la sala en un momento");
+            session.rejoin = Some(rejoin);
+        }
+        None => net::publish_state(sink, NetState::Desconectado),
+    }
 }
 
 /// Que hay que hacer después de leer del WebSocket.
@@ -797,5 +806,69 @@ mod tests {
         assert_eq!(backoff(2), Duration::from_secs(4));
         assert_eq!(backoff(3), REJOIN_MAX);
         assert_eq!(backoff(9), REJOIN_MAX);
+    }
+
+    /// La caída mientras somos el controlado deja armada la vuelta a esa
+    /// sala, y la etiqueta no pasa por «Desconectado».
+    #[test]
+    fn the_controlado_arms_its_way_back_when_the_connection_drops() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        session.room = Some("ABC234".to_string());
+        session.controlado = true;
+
+        connection_lost(
+            &mut session,
+            "se cortó la conexión con el servidor".to_string(),
+            &peer_tx,
+            &sink,
+        );
+
+        let rejoin = session.rejoin.as_ref().expect("queda armada la vuelta");
+        assert_eq!(rejoin.room, "ABC234");
+        assert!(
+            session.room.is_none(),
+            "la sala se olvida hasta que se vuelva a entrar"
+        );
+        assert!(matches!(peer_rx.try_recv(), Ok(PeerCommand::Stop)));
+
+        let recorded = events.lock().expect("el registro no está poisoned").clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::State(NetState::Conectando))),
+            "la etiqueta tenía que quedar esperando: {recorded:?}"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|event| matches!(event, Event::State(NetState::Desconectado))),
+            "la sala sigue en pie: {recorded:?}"
+        );
+    }
+
+    /// Salir a mano de la sala corta la vuelta: no se vuelve a una sala que
+    /// el usuario abandonó.
+    #[test]
+    fn leaving_the_room_cancels_the_way_back() {
+        let (sink, _events) = recording_sink();
+        let (peer_tx, _peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        session.room = Some("ABC234".to_string());
+        session.controlado = true;
+        connection_lost(
+            &mut session,
+            "se cortó la conexión con el servidor".to_string(),
+            &peer_tx,
+            &sink,
+        );
+        assert!(session.rejoin.is_some(), "primero queda armada");
+
+        handle_command(&mut session, Command::Disconnect, &peer_tx, &sink);
+
+        assert!(session.rejoin.is_none(), "salir de la sala corta la vuelta");
     }
 }

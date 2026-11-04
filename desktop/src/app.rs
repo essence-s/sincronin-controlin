@@ -5,6 +5,7 @@
 //! servicios de [`services`]; la integración con el sistema, en
 //! [`platform`]; la lógica de la red, en [`net`] y [`adapters::net`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -38,6 +39,13 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // ── Servicios de la capa de aplicación ────────────────────────────
     let media_service = MediaService::new(media.clone());
 
+    // Si el cliente es el controlador de la sala. Se fija al recibir el
+    // rol del servidor y se usa para habilitar o deshabilitar los
+    // controles de reproducción en la UI.
+    let is_controlador = Arc::new(AtomicBool::new(false));
+    let is_controlador_media = is_controlador.clone();
+    let is_controlador_net = is_controlador.clone();
+
     // SlintAdapter implementa UiPort: se le pasa a StateService para que
     // el servicio pueda actualizar la UI cuando llega estado remoto.
     let slint = SlintAdapter::new(&ui, net.clone(), media.clone());
@@ -46,25 +54,36 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let state = StateService::new(media.clone(), net.clone(), Arc::clone(&slint_arc));
     let state = Arc::new(Mutex::new(state));
 
-    // ── Backend de medios → StateService ──────────────────────────────
+    let ui_weak_media = ui.as_weak();
+
+    // ── Backend de medios → StateService + UI ─────────────────────────
     let state_media = Arc::clone(&state);
     media.on_snapshot(Box::new(move |snapshot: Snapshot| {
         let now = Instant::now();
+        let is_ctrl = is_controlador_media.load(Ordering::Relaxed);
+        let ui_weak = ui_weak_media.clone();
+        // Publicar por red (rate limiting, eco, etc.).
         state_media
             .lock()
             .expect("el servicio de estado no está poisoned")
-            .on_local_snapshot(snapshot, now);
+            .on_local_snapshot(snapshot.clone(), now);
+        // Actualizar la UI con el snapshot local.
+        ui_weak.upgrade_in_event_loop(move |ui| {
+            apply(&ui, &snapshot, is_ctrl);
+        });
     }));
+
+    let is_controlador_net = is_controlador.clone();
 
     // ── Red → eventos de dominio → StateService / UI ─────────────────
     let state_net = Arc::clone(&state);
     let media_net = media_service.clone();
-    let ui_weak = ui.as_weak();
-    let weak_net = ui_weak.clone();
-    let weak_toggle = ui_weak.clone();
-    let weak_connect = ui_weak.clone();
+    let weak_net = ui.as_weak();
+    let weak_toggle = ui.as_weak();
+    let weak_connect = ui.as_weak();
     net.on_event(Box::new(move |event: DomainNetEvent| {
         let ui_weak = weak_net.clone();
+        let is_controlador = is_controlador_net.clone();
         match event {
             DomainNetEvent::State(net_state) => {
                 let connected = net_state == DomainNetState::Conectado;
@@ -79,6 +98,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 }
             }
             DomainNetEvent::AssignedRole(role) => {
+                let is_ctrl = role == crate::domain::room::Role::Controlador;
+                is_controlador.store(is_ctrl, Ordering::Relaxed);
                 let texto = match role {
                     crate::domain::room::Role::Controlado => "controlado",
                     crate::domain::room::Role::Controlador => "controlador",
@@ -154,6 +175,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
             });
 
             if handle.get_net_open() {
+                // Mostrar el código de sala propia en el panel.
+                handle.set_room_code(net::local_room_code().into());
                 // Al abrir el panel, entrar a la sala propia.
                 net.connect(None);
             }
@@ -162,7 +185,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
     {
         let tx = net.clone();
-        let weak_connect = ui_weak.clone();
+        let weak_connect = ui.as_weak();
         ui.on_connect(move |room: SharedString| {
             let ui_weak = weak_connect.clone();
             let room = room.trim();

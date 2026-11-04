@@ -75,6 +75,15 @@ pub enum ClientMessage {
         /// `{"candidate":"candidate:...","sdpMid":null,...}`.
         candidate: Value,
     },
+    /// El controlado avisa a qué sala se fue.
+    ///
+    /// Lo manda él, no el servidor: la sala que lo recibe lo reenvía a
+    /// los demás sin interpretarlo, así que el servidor no necesita saber
+    /// quién es el controlado de cada sala.
+    Controlled {
+        /// Código de la sala a la que se fue.
+        room: String,
+    },
     /// El cliente se va de la sala.
     Leave,
 }

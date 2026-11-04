@@ -118,9 +118,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 let mut pending = pending_command
                     .lock()
                     .expect("el comando pendiente no está poisoned");
-                let is_echo = pending
-                    .as_ref()
-                    .is_some_and(|p| is_echo(p, &snapshot));
+                let is_echo = pending.as_ref().is_some_and(|p| is_echo(p, &snapshot));
                 if is_echo {
                     // Es el eco del comando remoto: no se publica y se descarta.
                     *pending = None;
@@ -566,7 +564,34 @@ fn apply_net(
             ui.set_role_text(texto.into());
             is_controlador.store(*role == net::Role::Controlador, Ordering::Relaxed);
         }
+        // El controlado se fue con el código a la mano: queda cargado para
+        // que seguirlo sea apretar Conectar.
+        net::Event::ControlledMoved { room } => {
+            append_log(ui, &format!("· el controlado se fue a la sala {room}"));
+            ui.set_peer_room(room.as_str().into());
+            open_panel(ui);
+        }
+        // Sin destino, la sala quedó sin controlado: se puede entrar a otra.
+        net::Event::ControlledLeft => {
+            append_log(ui, "· el controlado se fue: la sala quedó sin controlado");
+            ui.set_peer_room("".into());
+            open_panel(ui);
+        }
     }
+}
+
+/// Abre el panel de emparejamiento desde el código.
+///
+/// El alto de la ventana depende de `net-open`, y el re-anclaje de la
+/// ventana vive en el callback `net-toggled`, que acá no se dispara: hay
+/// que re-anclarla a mano.
+fn open_panel(ui: &AppWindow) {
+    if ui.get_net_open() {
+        return;
+    }
+
+    ui.set_net_open(true);
+    platform::configure(ui);
 }
 
 /// Agrega una línea al registro del panel de red.
@@ -940,10 +965,7 @@ mod tests {
         let start = Instant::now();
         let position = RemotePosition::new(5_000_000, 1.0, PlaybackState::Paused, start);
 
-        assert_eq!(
-            position.position(start + Duration::from_secs(2)),
-            5_000_000
-        );
+        assert_eq!(position.position(start + Duration::from_secs(2)), 5_000_000);
     }
 
     #[test]
@@ -1161,6 +1183,9 @@ mod tests {
         };
 
         assert!(!is_expired(&pending, start + Duration::from_millis(100)));
-        assert!(is_expired(&pending, start + ECHO_GRACE_PERIOD + Duration::from_millis(1)));
+        assert!(is_expired(
+            &pending,
+            start + ECHO_GRACE_PERIOD + Duration::from_millis(1)
+        ));
     }
 }

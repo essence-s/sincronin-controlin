@@ -79,26 +79,23 @@ pub(crate) fn run(
     peer_out_rx: Receiver<PeerOut>,
     sink: Sink,
 ) -> Result<(), Error> {
-    // La conexión con el servidor. `None` mientras no haya ninguna.
-    let mut ws: Option<WebSocket<MaybeTlsStream<TcpStream>>> = None;
-    // El identificador que nos dio el servidor.
-    let mut our_id: Option<u64> = None;
+    let mut session = Session::new();
 
     loop {
         // 1) Los comandos de la UI.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_command(cmd, &mut ws, &peer_tx, &sink);
+            handle_command(&mut session, cmd, &peer_tx, &sink);
         }
 
         // 2) Lo que el hilo de par quiere que mandemos al otro equipo.
         while let Ok(out) = peer_out_rx.try_recv() {
-            send_out(out, &mut ws);
+            send_out(&mut session, out);
         }
 
         // 3) Sin conexión: esperar a que llegue un comando.
-        if ws.is_none() {
+        if session.ws.is_none() {
             match cmd_rx.recv_timeout(IDLE_WAIT) {
-                Ok(cmd) => handle_command(cmd, &mut ws, &peer_tx, &sink),
+                Ok(cmd) => handle_command(&mut session, cmd, &peer_tx, &sink),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -106,30 +103,32 @@ pub(crate) fn run(
         }
 
         // 4) Leer del WebSocket.
-        let action = match ws.as_mut() {
-            Some(socket) => match socket.read() {
-                Ok(tungstenite::Message::Text(text)) => {
-                    handle_server(text.as_str(), &mut our_id, &peer_tx, &sink);
-                    Action::Keep
-                }
-                Ok(tungstenite::Message::Close(_)) => {
-                    Action::Close("el servidor cerró la conexión".to_string())
-                }
-                // Los pings los contesta la libreria; el resto no nos interesa.
-                Ok(_) => Action::Keep,
-                // El timeout del socket: no es un error, es la manera de
-                // volver al principio del bucle.
-                Err(tungstenite::Error::Io(err))
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    Action::Keep
-                }
-                Err(err) => Action::Close(format!("se cortó la conexión con el servidor: {err}")),
-            },
-            // Con la conexión abierta no puede pasar: se compruebo arriba.
+        //
+        // La lectura va aparte para soltar el préstamo del socket antes de
+        // atender el mensaje: atenderlo puede tocar la sesión.
+        let read = session.ws.as_mut().map(|socket| socket.read());
+        let action = match read {
+            Some(Ok(tungstenite::Message::Text(text))) => {
+                handle_server(&mut session, text.as_str(), &peer_tx, &sink);
+                Action::Keep
+            }
+            Some(Ok(tungstenite::Message::Close(_))) => {
+                Action::Close("el servidor cerró la conexión".to_string())
+            }
+            // Los pings los contesta la libreria; el resto no nos interesa.
+            Some(Ok(_)) => Action::Keep,
+            // El timeout del socket: no es un error, es la manera de
+            // volver al principio del bucle.
+            Some(Err(tungstenite::Error::Io(err)))
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Action::Keep
+            }
+            Some(Err(err)) => Action::Close(format!("se cortó la conexión con el servidor: {err}")),
+            // Con la conexión abierta no puede pasar: se comprueba arriba.
             None => Action::Keep,
         };
 
@@ -137,7 +136,7 @@ pub(crate) fn run(
         // usuario puede volver a conectarse cuando el servidor vuelva.
         if let Action::Close(reason) = action {
             net::publish_notice(&sink, reason);
-            ws = None;
+            session.forget();
             net::send_peer(&peer_tx, PeerCommand::Stop);
             net::publish_state(&sink, NetState::Desconectado);
         }
@@ -158,25 +157,77 @@ enum Action {
     Close(String),
 }
 
+/// Lo que el hilo sabe de la sala en la que está.
+///
+/// Se arma al entrar y se olvida al salir: fuera de una sala no hay nada
+/// que recordar.
+struct Session {
+    /// La conexión con el servidor. `None` mientras no haya ninguna.
+    ws: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
+    /// El identificador que nos dio el servidor.
+    our_id: Option<u64>,
+    /// La sala en la que estamos.
+    room: Option<String>,
+    /// Si somos el controlado de la sala.
+    controlado: bool,
+    /// El identificador del controlado, cuando somos controlador.
+    controlled: Option<u64>,
+}
+
+impl Session {
+    fn new() -> Self {
+        Self {
+            ws: None,
+            our_id: None,
+            room: None,
+            controlado: false,
+            controlled: None,
+        }
+    }
+
+    /// Se olvida de la sala: lo que se sabía de ella ya no vale.
+    fn forget(&mut self) {
+        self.ws = None;
+        self.our_id = None;
+        self.room = None;
+        self.controlado = false;
+        self.controlled = None;
+    }
+
+    /// Le avisa a la sala a dónde nos vamos, antes de irnos.
+    ///
+    /// Solo avisa el controlado, y solo si de verdad cambia de sala: el
+    /// servidor reenvía el mensaje a los que se quedan.
+    fn announce(&mut self, room: &str) {
+        if !self.controlado || self.room.as_deref() == Some(room) {
+            return;
+        }
+
+        let Some(socket) = self.ws.as_mut() else {
+            return;
+        };
+        send_frame(
+            socket,
+            &Frame::new(ClientMessage::Controlled {
+                room: room.to_string(),
+            }),
+        );
+    }
+
+    /// Se va de la sala, avisandole al servidor con protocolo.
+    fn leave(&mut self) {
+        if let Some(socket) = self.ws.as_mut() {
+            send_frame(socket, &Frame::new(ClientMessage::Leave));
+            let _ = socket.close(None);
+        }
+        self.forget();
+    }
+}
+
 /// Atiende un comando de la UI.
-fn handle_command(
-    cmd: Command,
-    ws: &mut Option<WebSocket<MaybeTlsStream<TcpStream>>>,
-    peer_tx: &Sender<PeerCommand>,
-    sink: &Sink,
-) {
+fn handle_command(session: &mut Session, cmd: Command, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
     match cmd {
         Command::Connect { room } => {
-            // Si ya había una conexión, se cierra. Con protocolo, para que
-            // el servidor no vea un reset.
-            if let Some(socket) = ws.as_mut() {
-                let _ = socket.close(None);
-            }
-            if ws.is_some() {
-                net::send_peer(peer_tx, PeerCommand::Stop);
-                *ws = None;
-            }
-
             // La sala: la que escribio el usuario o, si no escribio
             // ninguna, la nuestra.
             let room = if room.trim().is_empty() {
@@ -195,12 +246,22 @@ fn handle_command(
 
             eprintln!("[net] pido la sala {room}");
 
+            // Si somos el controlado de la sala, primero avisamos a dónde
+            // vamos: el servidor lo reenvía a los controladores que se
+            // quedan, así saben a quién seguir.
+            session.announce(&room);
+
+            // Si ya había una conexión, se cierra. Con protocolo, para que
+            // el servidor no vea un reset.
+            session.leave();
+            net::send_peer(peer_tx, PeerCommand::Stop);
+
             match connect(&room) {
                 Ok(mut socket) => {
                     // El primer mensaje: en que sala estamos.
                     let frame = Frame::new(ClientMessage::Join { room: room.clone() });
                     send_frame(&mut socket, &frame);
-                    *ws = Some(socket);
+                    session.ws = Some(socket);
                 }
                 Err(err) => {
                     net::publish_notice(
@@ -216,11 +277,7 @@ fn handle_command(
         }
         Command::Disconnect => {
             // Avisamos al servidor para que le diga al otro equipo.
-            if let Some(socket) = ws.as_mut() {
-                let frame = Frame::new(ClientMessage::Leave);
-                send_frame(socket, &frame);
-            }
-            *ws = None;
+            session.leave();
             net::send_peer(peer_tx, PeerCommand::Stop);
             net::publish_state(sink, NetState::Desconectado);
             net::publish_notice(sink, "se cortó la conexión");
@@ -261,7 +318,7 @@ fn set_read_timeout(
 }
 
 /// Atiende un mensaje del servidor.
-fn handle_server(text: &str, our_id: &mut Option<u64>, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
+fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
     let frame: Frame<ServerMessage> = match serde_json::from_str(text) {
         Ok(frame) => frame,
         Err(err) => {
@@ -286,7 +343,13 @@ fn handle_server(text: &str, our_id: &mut Option<u64>, peer_tx: &Sender<PeerComm
 
     match frame.body {
         ServerMessage::Joined { room, id, peers } => {
-            *our_id = Some(id);
+            session.our_id = Some(id);
+            session.room = Some(room.clone());
+            // El primero de la sala es el controlado; los que llegan
+            // después controlan al de menor identificador.
+            session.controlado = peers.is_empty();
+            session.controlled = peers.iter().min().copied();
+
             // El hilo de par ya puede preparar la sesión.
             net::send_peer(peer_tx, PeerCommand::Start { id });
             net::publish_notice(sink, format!("en la sala {room}"));
@@ -304,7 +367,7 @@ fn handle_server(text: &str, our_id: &mut Option<u64>, peer_tx: &Sender<PeerComm
                 }
             }
 
-            if peers.is_empty() {
+            if session.controlado {
                 eprintln!("[net] esperando a que otro equipo entre en la sala {room}");
                 net::publish_role(sink, Role::Controlado);
             } else {
@@ -312,7 +375,7 @@ fn handle_server(text: &str, our_id: &mut Option<u64>, peer_tx: &Sender<PeerComm
             }
         }
         ServerMessage::PeerJoined { peer } => {
-            let Some(id) = *our_id else {
+            let Some(id) = session.our_id else {
                 return;
             };
 
@@ -332,14 +395,25 @@ fn handle_server(text: &str, our_id: &mut Option<u64>, peer_tx: &Sender<PeerComm
         }
         ServerMessage::PeerLeft { peer } => {
             eprintln!("[net] se fue el otro equipo (id {peer})");
+
+            // Si el que se fue es el controlado, en esta sala ya no hay a
+            // quién controlar: se suelta y se avisa.
+            if !session.controlado && session.controlled == Some(peer) {
+                net::publish_controlled_left(sink);
+                net::send_peer(peer_tx, PeerCommand::Stop);
+                session.leave();
+                net::publish_state(sink, NetState::Desconectado);
+                return;
+            }
+
             // Se cae la sesión: si el otro equipo vuelve, se empareja de
             // nuevo.
             net::send_peer(peer_tx, PeerCommand::Stop);
             net::publish_state(sink, NetState::Conectando);
             net::publish_notice(sink, "el otro equipo se fue de la sala");
         }
-        ServerMessage::Relay { message, .. } => {
-            handle_relay(message, peer_tx, sink);
+        ServerMessage::Relay { peer, message } => {
+            handle_relay(session, peer, message, peer_tx, sink);
         }
         ServerMessage::Error { code, message } => {
             eprintln!("[net] el servidor dijo: {message} ({code})");
@@ -349,7 +423,13 @@ fn handle_server(text: &str, our_id: &mut Option<u64>, peer_tx: &Sender<PeerComm
 }
 
 /// Atiende un mensaje que otro cliente mando y el servidor reenvío.
-fn handle_relay(message: Value, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
+fn handle_relay(
+    session: &mut Session,
+    peer: u64,
+    message: Value,
+    peer_tx: &Sender<PeerCommand>,
+    sink: &Sink,
+) {
     let message: ClientMessage = match serde_json::from_value(message) {
         Ok(message) => message,
         Err(err) => {
@@ -374,14 +454,32 @@ fn handle_relay(message: Value, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
             eprintln!("[net] llegó un candidato ICE");
             net::send_peer(peer_tx, PeerCommand::AddIce(candidate));
         }
+        // El controlado avisa a qué sala se fue. Solo vale si viene del
+        // controlado de esta sala: el resto se ignora.
+        ClientMessage::Controlled { room } => {
+            if session.controlled != Some(peer) {
+                return;
+            }
+            let Some(room) = protocol::normalize_room(&room) else {
+                net::publish_notice(sink, "el controlado avisó una sala que no se entiende");
+                return;
+            };
+
+            eprintln!("[net] el controlado se fue a la sala {room}");
+
+            net::publish_controlled_moved(sink, room);
+            net::send_peer(peer_tx, PeerCommand::Stop);
+            session.leave();
+            net::publish_state(sink, NetState::Desconectado);
+        }
         // El join y el leave los maneja el servidor, no el par.
         ClientMessage::Join { .. } | ClientMessage::Leave => {}
     }
 }
 
 /// Manda al otro equipo lo que pidió el hilo de par.
-fn send_out(out: PeerOut, ws: &mut Option<WebSocket<MaybeTlsStream<TcpStream>>>) {
-    let Some(socket) = ws.as_mut() else {
+fn send_out(session: &mut Session, out: PeerOut) {
+    let Some(socket) = session.ws.as_mut() else {
         return;
     };
 

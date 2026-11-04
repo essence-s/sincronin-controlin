@@ -120,6 +120,13 @@ pub enum Event {
     Notice(String),
     /// El rol asignado en la sala: controlado o controlador.
     AssignedRole(Role),
+    /// El controlado se fue a otra sala, avisando a dónde.
+    ControlledMoved {
+        /// La sala en la que está ahora.
+        room: String,
+    },
+    /// El controlado se fue sin decir a dónde: la sala quedó sin controlado.
+    ControlledLeft,
 }
 
 /// Callback con el que el módulo publica cada evento.
@@ -305,6 +312,16 @@ pub(crate) fn publish_role(sink: &Sink, role: Role) {
     sink(Event::AssignedRole(role));
 }
 
+/// Publica que el controlado se fue a otra sala.
+pub(crate) fn publish_controlled_moved(sink: &Sink, room: String) {
+    sink(Event::ControlledMoved { room });
+}
+
+/// Publica que el controlado se fue sin dejar destino.
+pub(crate) fn publish_controlled_left(sink: &Sink) {
+    sink(Event::ControlledLeft);
+}
+
 /// Envía un comando al hilo de par, avisando si no se pudo.
 pub(crate) fn send_peer(peer_tx: &Sender<PeerCommand>, command: PeerCommand) {
     let _ = peer_tx.send(command);
@@ -338,6 +355,13 @@ mod tests {
     /// La sala del test de STUN: cada test usa la suya, porque corren
     /// en paralelo y el servidor agrupa por sala.
     const STUN_ROOM: &str = "J4X8TZ";
+
+    /// Las salas de las pruebas de traspaso: cada test usa las suyas.
+    const HANDOFF_ROOM_A: &str = "R3T5VW";
+    const HANDOFF_ROOM_B: &str = "S7W9XY";
+    const HANDOFF_ROOM_C: &str = "V2X4ZA";
+    const HANDOFF_ROOM_D: &str = "W6Y8BC";
+    const HANDOFF_ROOM_E: &str = "Y8AB2C";
 
     #[test]
     fn a_room_code_has_the_right_shape() {
@@ -382,6 +406,9 @@ mod tests {
                 room: OTHER_ROOM.to_string(),
             })
             .expect("el canal de comandos está abierto");
+        // A entra primero: es el controlado, que es el que se queda en la
+        // sala cuando el otro se va.
+        wait_for(&events_a, is_controlado);
         cmd_b
             .send(Command::Connect {
                 room: OTHER_ROOM.to_string(),
@@ -468,6 +495,170 @@ mod tests {
         });
     }
 
+    /// El controlado, al irse a otra sala, avisa a dónde: el controlador
+    /// que queda en la sala vieja recibe el código de la sala nueva.
+    #[test]
+    fn the_controlado_announces_the_room_it_moves_to() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        // A entra a su sala y B se le une: A es el controlado.
+        cmd_a
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_A.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+        cmd_b
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_A.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+        wait_for(&events_b, channel_opened);
+
+        // C entra a la suya: es el nuevo controlado.
+        cmd_c
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_B.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::AssignedRole(Role::Controlado)))
+        });
+
+        // A se va a la sala de C.
+        cmd_a
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_B.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        // B recibe el aviso con la sala nueva.
+        wait_for(&events_b, |events| {
+            events.iter().any(
+                |event| matches!(event, Event::ControlledMoved { room } if room == HANDOFF_ROOM_B),
+            )
+        });
+    }
+
+    /// Después del aviso, el controlador suelta la sala: ya no hay a quién
+    /// controlar ahí, y lo que mande no le llega al controlado viejo.
+    #[test]
+    fn the_controller_leaves_the_room_after_a_handoff() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_C.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+        cmd_b
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_C.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+        wait_for(&events_b, channel_opened);
+
+        // El otro controlado, en su sala.
+        cmd_c
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_D.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::AssignedRole(Role::Controlado)))
+        });
+
+        cmd_a
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_D.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        // Primero el aviso, después la sala suelta.
+        wait_for(&events_b, |events| {
+            let moved = events
+                .iter()
+                .position(|event| matches!(event, Event::ControlledMoved { .. }));
+            moved.is_some_and(|index| {
+                events[index..]
+                    .iter()
+                    .any(|event| matches!(event, Event::State(NetState::Desconectado)))
+            })
+        });
+
+        // Ya sin sala, lo que mande no sale.
+        cmd_b
+            .send(Command::Send("hola".to_string()))
+            .expect("el canal de comandos está abierto");
+        std::thread::sleep(Duration::from_millis(500));
+
+        let received = events_a
+            .lock()
+            .expect("el registro no está poisoned")
+            .clone();
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "hola")),
+            "el controlador no tenía que poder mandar: {received:?}"
+        );
+    }
+
+    /// Si el controlado se va sin decir a dónde, el controlador lo sabe y
+    /// suelta la sala: no queda esperando a alguien que no va a volver.
+    #[test]
+    fn the_controller_leaves_the_room_when_the_controlado_disappears() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_E.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+        cmd_b
+            .send(Command::Connect {
+                room: HANDOFF_ROOM_E.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+        wait_for(&events_b, channel_opened);
+
+        // El controlado se va sin destino.
+        cmd_a
+            .send(Command::Disconnect)
+            .expect("el canal de comandos está abierto");
+
+        wait_for(&events_b, |events| {
+            let gone = events
+                .iter()
+                .position(|event| matches!(event, Event::ControlledLeft));
+            gone.is_some_and(|index| {
+                events[index..]
+                    .iter()
+                    .any(|event| matches!(event, Event::State(NetState::Desconectado)))
+            })
+        });
+    }
+
     /// El servidor STUN contestó a los dos: anuncia la dirección pública.
     fn stun_responded(events: &[Event]) -> bool {
         events
@@ -518,6 +709,13 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Message(text) if text == "hola"))
         });
+    }
+
+    /// Si el cliente entró a una sala vacía: es el controlado.
+    fn is_controlado(events: &[Event]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::AssignedRole(Role::Controlado)))
     }
 
     /// Si el canal de datos se abrió.

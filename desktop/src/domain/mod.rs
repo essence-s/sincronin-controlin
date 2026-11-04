@@ -6,4 +6,5 @@
 pub mod echo;
 pub mod interpolation;
 pub mod media;
+pub mod net;
 pub mod room;

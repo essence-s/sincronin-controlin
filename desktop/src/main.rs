@@ -18,6 +18,7 @@ mod app;
 mod domain;
 mod media;
 mod net;
+mod ports;
 mod platform;
 
 // Genera `AppWindow` y `NetWindow` en la raíz del crate. Tiene que

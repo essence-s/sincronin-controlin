@@ -528,7 +528,7 @@ fn read_controls(
         can_seek = controls.IsPlaybackPositionEnabled().unwrap_or(true);
     }
 
-    let playback_rate = info.PlaybackRate().and_then(|r| r.get()).unwrap_or(1.0);
+    let playback_rate = info.PlaybackRate().and_then(|r| r.Value()).unwrap_or(1.0);
 
     (state, can_toggle, can_seek, playback_rate)
 }

@@ -1,4 +1,6 @@
-//! Adaptador de UI: implementa [`crate::ports::UiPort`] sobre Slint y conecta
-//! los callbacks de la ventana a los servicios de aplicación.
+//! Adaptador de UI: implementa [`crate::ports::UiPort`] sobre Slint.
+//!
+//! El cableado de los callbacks vive en [`crate::app`]; este módulo solo
+//! pinta el estado que le piden los servicios.
 
 pub mod slint;

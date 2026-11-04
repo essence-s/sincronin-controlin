@@ -4,20 +4,19 @@
 //! Traduce los eventos de `crate::net::Event` a `crate::domain::net::NetEvent`
 //! y expone el puerto que consumen los servicios de aplicación.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::ports::NetPort;
 use crate::domain::net::NetEvent;
 use crate::domain::room::Role as DomainRole;
+use crate::ports::NetPort;
 
 use crate::net::{self, Command, Event as NetRawEvent, NetState as RawNetState, Role as RawRole};
 
 /// Estado interno compartido para permitir clonar el adaptador.
 struct Inner {
     cmd_tx: Sender<Command>,
-    events: Arc<Mutex<Vec<NetEvent>>>,
     rx: Receiver<NetRawEvent>,
 }
 
@@ -43,23 +42,8 @@ impl NetAdapter {
         Self {
             inner: Arc::new(Inner {
                 cmd_tx,
-                events: Arc::new(Mutex::new(Vec::new())),
                 rx: sink_rx,
             }),
-        }
-    }
-
-    /// Drena los eventos crudos y los traduce al dominio, invocando el
-    /// callback para cada uno.
-    fn pump_events(&self, callback: &dyn Fn(NetEvent)) {
-        while let Ok(event) = self.inner.rx.try_recv() {
-            let domain_event = translate(event);
-            self.inner
-                .events
-                .lock()
-                .expect("el registro de eventos no está poisoned")
-                .push(domain_event.clone());
-            callback(domain_event);
         }
     }
 }
@@ -74,34 +58,23 @@ impl NetPort for NetAdapter {
         let _ = self.inner.cmd_tx.send(Command::Disconnect);
     }
 
+    fn local_room_code(&self) -> String {
+        net::local_room_code().to_string()
+    }
+
     fn send_data(&self, text: String) {
         let _ = self.inner.cmd_tx.send(net::Command::Send(text));
     }
 
     fn on_event(&self, callback: Box<dyn Fn(NetEvent) + Send + Sync>) {
         let callback = Arc::new(callback);
-        let events = Arc::clone(&self.inner.events);
         let rx = self.inner.rx.clone();
 
         std::thread::Builder::new()
             .name("net-adapter".to_string())
             .spawn(move || {
-                // Reenviar eventos acumulados antes de suscribirse.
-                {
-                    let accumulated = events
-                        .lock()
-                        .expect("el registro de eventos no está poisoned")
-                        .clone();
-                    for e in accumulated {
-                        callback(e);
-                    }
-                }
-
-                loop {
-                    match rx.recv() {
-                        Ok(event) => callback(translate(event)),
-                        Err(_) => break,
-                    }
+                while let Ok(event) = rx.recv() {
+                    callback(translate(event));
                 }
             })
             .expect("no se pudo crear el hilo puente de red");
@@ -134,22 +107,18 @@ mod tests {
     #[test]
     fn translate_state_desconectado() {
         let event = NetRawEvent::State(RawNetState::Desconectado);
-        assert!(
-            matches!(
-                translate(event),
-                NetEvent::State(crate::domain::net::NetState::Desconectado)
-            )
-        );
+        assert!(matches!(
+            translate(event),
+            NetEvent::State(crate::domain::net::NetState::Desconectado)
+        ));
     }
 
     #[test]
     fn translate_assigned_role_controlador() {
         let event = NetRawEvent::AssignedRole(RawRole::Controlador);
-        assert!(
-            matches!(
-                translate(event),
-                NetEvent::AssignedRole(DomainRole::Controlador)
-            )
-        );
+        assert!(matches!(
+            translate(event),
+            NetEvent::AssignedRole(DomainRole::Controlador)
+        ));
     }
 }

@@ -3,21 +3,32 @@
 //!
 //! Traduce los comandos de la aplicación al canal de comandos del backend y
 //! los snapshots del backend al callback del puerto.
+//!
+//! Guarda la última foto: el backend puede publicar antes de que la
+//! aplicación registre su callback, y en Windows no vuelve a publicar hasta
+//! que ocurra un evento nuevo.
 
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Sender, unbounded};
 
-use crate::ports::MediaPort;
 use crate::domain::media::{Command, Snapshot};
+use crate::ports::MediaPort;
 
 use crate::media::Sink as MediaSink;
 use crate::platform;
 
+/// Callback del puerto y última foto publicada por el backend.
+#[derive(Default)]
+struct State {
+    callback: Option<Arc<dyn Fn(Snapshot) + Send + Sync>>,
+    last_snapshot: Option<Snapshot>,
+}
+
 /// Estado interno compartido para permitir clonar el adaptador.
 struct Inner {
     cmd_tx: Sender<Command>,
-    snapshot_cb: Arc<Mutex<Option<Box<dyn Fn(Snapshot) + Send + Sync>>>>,
+    state: Arc<Mutex<State>>,
 }
 
 /// Adaptador de medios.
@@ -33,23 +44,26 @@ impl MediaAdapter {
     /// Levanta el hilo de medios y devuelve el adaptador listo para usar.
     pub fn spawn() -> Self {
         let (cmd_tx, cmd_rx) = unbounded();
-        let snapshot_cb: Arc<Mutex<Option<Box<dyn Fn(Snapshot) + Send + Sync>>>> =
-            Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(State::default()));
 
-        let cb = Arc::clone(&snapshot_cb);
+        let sink_state = Arc::clone(&state);
         let sink: MediaSink = Arc::new(move |snapshot: Snapshot| {
-            if let Some(callback) = cb.lock().expect("el callback no está poisoned").as_ref() {
-                callback(snapshot.clone());
+            let mut state = sink_state
+                .lock()
+                .expect("el estado de medios no está poisoned");
+            state.last_snapshot = Some(snapshot.clone());
+            let callback = state.callback.clone();
+            drop(state);
+
+            if let Some(callback) = callback {
+                callback(snapshot);
             }
         });
 
         platform::spawn(cmd_rx, sink);
 
         Self {
-            inner: Arc::new(Inner {
-                cmd_tx,
-                snapshot_cb,
-            }),
+            inner: Arc::new(Inner { cmd_tx, state }),
         }
     }
 }
@@ -60,10 +74,23 @@ impl MediaPort for MediaAdapter {
     }
 
     fn on_snapshot(&self, callback: Box<dyn Fn(Snapshot) + Send + Sync>) {
-        *self
+        let callback: Arc<dyn Fn(Snapshot) + Send + Sync> = Arc::from(callback);
+        let mut state = self
             .inner
-            .snapshot_cb
+            .state
             .lock()
-            .expect("el callback no está poisoned") = Some(callback);
+            .expect("el estado de medios no está poisoned");
+
+        let had_callback = state.callback.is_some();
+        state.callback = Some(Arc::clone(&callback));
+
+        // Si el backend publicó antes de que hubiera suscriptor, se le
+        // entrega esa foto ahora. Se llama con el mutex tomado para que el
+        // hilo de medios no entregue una foto más nueva antes que esta.
+        if !had_callback {
+            if let Some(snapshot) = state.last_snapshot.clone() {
+                callback(snapshot);
+            }
+        }
     }
 }

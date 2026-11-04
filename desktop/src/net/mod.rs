@@ -96,19 +96,6 @@ pub enum NetState {
     Conectado,
 }
 
-impl NetState {
-    /// El texto para la UI.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Desconectado => "Desconectado",
-            // No es "conectando": el servidor ya está. Lo que falta es el
-            // otro equipo.
-            Self::Conectando => "Esperando al otro equipo",
-            Self::Conectado => "Conectado",
-        }
-    }
-}
-
 /// Lo que el módulo de red le publica a la UI.
 #[derive(Clone, Debug)]
 pub enum Event {

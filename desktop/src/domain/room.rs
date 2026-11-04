@@ -7,5 +7,12 @@ pub enum Role {
     Controlador,
 }
 
-/// Identificador de par (equipo remoto en la señalización WebRTC).
-pub type PeerId = u64;
+impl Role {
+    /// El texto para la UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Controlado => "controlado",
+            Self::Controlador => "controlador",
+        }
+    }
+}

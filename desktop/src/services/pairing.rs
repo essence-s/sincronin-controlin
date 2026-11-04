@@ -23,4 +23,9 @@ impl<N: NetPort + Clone> PairingService<N> {
     pub fn disconnect(&self) {
         self.net.disconnect();
     }
+
+    /// Código de la sala propia de este cliente.
+    pub fn local_room_code(&self) -> String {
+        self.net.local_room_code()
+    }
 }

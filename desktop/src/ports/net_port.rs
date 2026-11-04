@@ -18,6 +18,9 @@ pub trait NetPort: Send + Sync + 'static {
     /// Salir de la sala actual.
     fn disconnect(&self);
 
+    /// Código de la sala propia de este cliente.
+    fn local_room_code(&self) -> String;
+
     /// Enviar un mensaje por el canal de datos WebRTC.
     fn send_data(&self, text: String);
 

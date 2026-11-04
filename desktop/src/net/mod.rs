@@ -356,6 +356,12 @@ mod tests {
     /// en paralelo y el servidor agrupa por sala.
     const STUN_ROOM: &str = "J4X8TZ";
 
+    /// Las salas de las pruebas de cambio de sala: cada test usa las suyas.
+    const SWITCH_FROM_ROOM: &str = "Z2C4DF";
+    const SWITCH_TO_ROOM: &str = "T8V6WX";
+    const SWITCH_OLD_ROOM: &str = "X4Z6AB";
+    const SWITCH_NEW_ROOM: &str = "Y2C8DE";
+
     /// Las salas de las pruebas de traspaso: cada test usa las suyas.
     const HANDOFF_ROOM_A: &str = "R3T5VW";
     const HANDOFF_ROOM_B: &str = "S7W9XY";
@@ -709,6 +715,134 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Message(text) if text == "hola"))
         });
+    }
+
+    /// Un controlador que entra a otra sala deja la anterior: los que se
+    /// quedan lo ven salir y él queda en la sala nueva.
+    #[test]
+    fn the_controller_leaves_the_previous_room_when_it_joins_another() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        // A entra primero: es el controlado de su sala.
+        cmd_a
+            .send(Command::Connect {
+                room: SWITCH_FROM_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+
+        // B se le une como controlador: el canal se abre.
+        cmd_b
+            .send(Command::Connect {
+                room: SWITCH_FROM_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+
+        // C espera solo en otra sala, como controlado.
+        cmd_c
+            .send(Command::Connect {
+                room: SWITCH_TO_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, is_controlado);
+
+        // B se va a la sala de C.
+        cmd_b
+            .send(Command::Connect {
+                room: SWITCH_TO_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        // A lo ve salir...
+        wait_for(&events_a, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Notice(text) if text.contains("se fue")))
+        });
+
+        // ...y B queda en la sala nueva, emparejado con C.
+        wait_for(&events_b, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Notice(text) if text.contains(SWITCH_TO_ROOM)))
+        });
+        wait_for(&events_c, channel_opened);
+    }
+
+    /// Después de cambiar de sala, los comandos van solo al controlado
+    /// nuevo: el viejo no recibe nada.
+    #[test]
+    fn the_controller_only_talks_to_the_controlado_of_its_room() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: SWITCH_OLD_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+
+        cmd_b
+            .send(Command::Connect {
+                room: SWITCH_OLD_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+
+        cmd_c
+            .send(Command::Connect {
+                room: SWITCH_NEW_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, is_controlado);
+
+        // B cambia de sala: el segundo canal es el de la nueva.
+        cmd_b
+            .send(Command::Connect {
+                room: SWITCH_NEW_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_b, |events| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::Notice(text) if text.contains("canal de datos abierto"))
+                })
+                .count()
+                >= 2
+        });
+
+        // Al controlado nuevo le llega...
+        cmd_b
+            .send(Command::Send("hola".to_string()))
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "hola"))
+        });
+
+        // ...y al viejo no.
+        std::thread::sleep(Duration::from_millis(500));
+        let received = events_a
+            .lock()
+            .expect("el registro no está poisoned")
+            .clone();
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "hola")),
+            "el controlado viejo no tenía que recibir nada: {received:?}"
+        );
     }
 
     /// Si el cliente entró a una sala vacía: es el controlado.

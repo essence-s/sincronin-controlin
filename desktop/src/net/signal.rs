@@ -242,35 +242,7 @@ fn handle_command(session: &mut Session, cmd: Command, peer_tx: &Sender<PeerComm
                 return;
             };
 
-            net::publish_state(sink, NetState::Conectando);
-
-            eprintln!("[net] pido la sala {room}");
-
-            // Si somos el controlado de la sala, primero avisamos a dónde
-            // vamos: el servidor lo reenvía a los controladores que se
-            // quedan, así saben a quién seguir.
-            session.announce(&room);
-
-            // Si ya había una conexión, se cierra. Con protocolo, para que
-            // el servidor no vea un reset.
-            session.leave();
-            net::send_peer(peer_tx, PeerCommand::Stop);
-
-            match connect(&room) {
-                Ok(mut socket) => {
-                    // El primer mensaje: en que sala estamos.
-                    let frame = Frame::new(ClientMessage::Join { room: room.clone() });
-                    send_frame(&mut socket, &frame);
-                    session.ws = Some(socket);
-                }
-                Err(err) => {
-                    net::publish_notice(
-                        sink,
-                        format!("no se pudo conectar con el servidor: {err}"),
-                    );
-                    net::publish_state(sink, NetState::Desconectado);
-                }
-            }
+            enter(session, &room, peer_tx, sink);
         }
         Command::Send(text) => {
             net::send_peer(peer_tx, PeerCommand::Send(text));
@@ -281,6 +253,38 @@ fn handle_command(session: &mut Session, cmd: Command, peer_tx: &Sender<PeerComm
             net::send_peer(peer_tx, PeerCommand::Stop);
             net::publish_state(sink, NetState::Desconectado);
             net::publish_notice(sink, "se cortó la conexión");
+        }
+    }
+}
+
+/// Entra a una sala: corta lo que había y abre la conexión nueva.
+fn enter(session: &mut Session, room: &str, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
+    net::publish_state(sink, NetState::Conectando);
+
+    eprintln!("[net] pido la sala {room}");
+
+    // Si somos el controlado de la sala, primero avisamos a dónde vamos:
+    // el servidor lo reenvía a los controladores que se quedan, así saben
+    // a quién seguir.
+    session.announce(room);
+
+    // Si ya había una conexión, se cierra. Con protocolo, para que el
+    // servidor no vea un reset.
+    session.leave();
+    net::send_peer(peer_tx, PeerCommand::Stop);
+
+    match connect(room) {
+        Ok(mut socket) => {
+            // El primer mensaje: en que sala estamos.
+            let frame = Frame::new(ClientMessage::Join {
+                room: room.to_string(),
+            });
+            send_frame(&mut socket, &frame);
+            session.ws = Some(socket);
+        }
+        Err(err) => {
+            net::publish_notice(sink, format!("no se pudo conectar con el servidor: {err}"));
+            net::publish_state(sink, NetState::Desconectado);
         }
     }
 }
@@ -465,12 +469,14 @@ fn handle_relay(
                 return;
             };
 
-            eprintln!("[net] el controlado se fue a la sala {room}");
+            eprintln!("[net] el controlado se fue a la sala {room}: lo sigo");
 
-            net::publish_controlled_moved(sink, room);
-            net::send_peer(peer_tx, PeerCommand::Stop);
-            session.leave();
+            net::publish_controlled_moved(sink, room.clone());
             net::publish_state(sink, NetState::Desconectado);
+
+            // Y se lo sigue solo: el aviso ya trajo el código, así que no
+            // hay que apretar nada.
+            enter(session, &room, peer_tx, sink);
         }
         // El join y el leave los maneja el servidor, no el par.
         ClientMessage::Join { .. } | ClientMessage::Leave => {}

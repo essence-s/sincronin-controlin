@@ -564,11 +564,15 @@ fn apply_net(
             ui.set_role_text(texto.into());
             is_controlador.store(*role == net::Role::Controlador, Ordering::Relaxed);
         }
-        // El controlado se fue con el código a la mano: queda cargado para
-        // que seguirlo sea apretar Conectar.
+        // El controlado se fue con el código a la mano: la red ya lo sigue
+        // sola, así que la sala nueva pasa a ser la propia.
         net::Event::ControlledMoved { room } => {
-            append_log(ui, &format!("· el controlado se fue a la sala {room}"));
-            ui.set_peer_room(room.as_str().into());
+            append_log(
+                ui,
+                &format!("· el controlado se fue a la sala {room}: entrando"),
+            );
+            ui.set_room_code(room.as_str().into());
+            ui.set_peer_room("".into());
             open_panel(ui);
         }
         // Sin destino, la sala quedó sin controlado: se puede entrar a otra.

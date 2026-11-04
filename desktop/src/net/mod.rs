@@ -362,6 +362,12 @@ mod tests {
     const SWITCH_OLD_ROOM: &str = "X4Z6AB";
     const SWITCH_NEW_ROOM: &str = "Y2C8DE";
 
+    /// Las salas de las pruebas de reasignación: cada test usa las suyas.
+    const FOLLOW_OLD_ROOM: &str = "C2D4EF";
+    const FOLLOW_NEW_ROOM: &str = "F6G8HJ";
+    const FOLLOW_FROM_ROOM: &str = "K2M4NP";
+    const FOLLOW_TO_ROOM: &str = "Q6R8ST";
+
     /// Las salas de las pruebas de traspaso: cada test usa las suyas.
     const HANDOFF_ROOM_A: &str = "R3T5VW";
     const HANDOFF_ROOM_B: &str = "S7W9XY";
@@ -843,6 +849,121 @@ mod tests {
                 .any(|event| matches!(event, Event::Message(text) if text == "hola")),
             "el controlado viejo no tenía que recibir nada: {received:?}"
         );
+    }
+
+    /// El que era controlado, al entrar a la sala de otro, queda como
+    /// controlador: el grupo conserva un solo controlado.
+    #[test]
+    fn the_former_controlado_is_a_controller_in_the_new_room() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, _events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        // A es el controlado de su sala, con B de controlador.
+        cmd_a
+            .send(Command::Connect {
+                room: FOLLOW_OLD_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+        cmd_b
+            .send(Command::Connect {
+                room: FOLLOW_OLD_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+
+        // C espera en otra sala, como controlado.
+        cmd_c
+            .send(Command::Connect {
+                room: FOLLOW_NEW_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, is_controlado);
+
+        // A se conecta al otro controlado.
+        cmd_a
+            .send(Command::Connect {
+                room: FOLLOW_NEW_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        // Su último rol es controlador.
+        wait_for(&events_a, |events| {
+            let roles: Vec<Role> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::AssignedRole(role) => Some(*role),
+                    _ => None,
+                })
+                .collect();
+            roles.last() == Some(&Role::Controlador)
+        });
+    }
+
+    /// El controlador sigue al controlado a la sala nueva sin que nadie
+    /// apriete nada: el aviso ya trae el código.
+    #[test]
+    fn the_controller_follows_the_controlado_without_pressing_anything() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: FOLLOW_FROM_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+        cmd_b
+            .send(Command::Connect {
+                room: FOLLOW_FROM_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+
+        cmd_c
+            .send(Command::Connect {
+                room: FOLLOW_TO_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, is_controlado);
+
+        // El controlado se va con el código; B no manda nada.
+        cmd_a
+            .send(Command::Connect {
+                room: FOLLOW_TO_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        // B entra solo a la sala nueva: el aviso ya trajo el código, y
+        // el servidor confirma que quedó adentro.
+        wait_for(&events_b, |events| {
+            let moved = events.iter().position(
+                |event| matches!(event, Event::ControlledMoved { room } if room == FOLLOW_TO_ROOM),
+            );
+            moved.is_some_and(|index| {
+                events[index..].iter().any(
+                    |event| matches!(event, Event::Notice(text) if text.contains(FOLLOW_TO_ROOM)),
+                )
+            })
+        });
+
+        // Y en la sala nueva es controlador del controlado que ya estaba.
+        wait_for(&events_b, |events| {
+            let roles: Vec<Role> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::AssignedRole(role) => Some(*role),
+                    _ => None,
+                })
+                .collect();
+            roles.last() == Some(&Role::Controlador)
+        });
     }
 
     /// Si el cliente entró a una sala vacía: es el controlado.

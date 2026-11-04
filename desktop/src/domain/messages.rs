@@ -15,6 +15,10 @@ pub struct RemoteState {
     pub playback_rate: f64,
     pub title: String,
     pub artist: String,
+    /// El reproductor del controlado permite play/pausa/stop.
+    pub can_toggle: bool,
+    /// El reproductor del controlado permite buscar.
+    pub can_seek: bool,
 }
 
 /// Lo que puede llegar por el canal de datos.
@@ -43,6 +47,8 @@ pub fn state_message(snapshot: &Snapshot) -> String {
         "playback_rate": snapshot.playback_rate,
         "title": &snapshot.title,
         "artist": &snapshot.artist,
+        "can_toggle": snapshot.can_toggle,
+        "can_seek": snapshot.can_seek,
     })
     .to_string()
 }
@@ -61,8 +67,21 @@ pub fn parse_state_message(text: &str) -> Option<RemoteState> {
         _ => PlaybackState::Unknown,
     };
 
+    let has_session = value.get("has_session")?.as_bool()?;
+
+    // Un controlado de una versión anterior no manda las capacidades: si
+    // hay sesión, se asume que se puede controlar.
+    let can_toggle = value
+        .get("can_toggle")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(has_session);
+    let can_seek = value
+        .get("can_seek")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(has_session);
+
     Some(RemoteState {
-        has_session: value.get("has_session")?.as_bool()?,
+        has_session,
         playback,
         position_ticks: value.get("position_ms")?.as_i64()?.saturating_mul(10_000),
         duration_ticks: value.get("duration_ms")?.as_i64()?.saturating_mul(10_000),
@@ -72,6 +91,8 @@ pub fn parse_state_message(text: &str) -> Option<RemoteState> {
             .unwrap_or(1.0),
         title: value.get("title")?.as_str()?.to_string(),
         artist: value.get("artist")?.as_str()?.to_string(),
+        can_toggle,
+        can_seek,
     })
 }
 
@@ -218,6 +239,41 @@ mod tests {
     }
 
     #[test]
+    fn state_message_carries_the_control_capabilities() {
+        let snapshot = Snapshot {
+            can_toggle: true,
+            can_seek: false,
+            ..playing(0)
+        };
+
+        let text = state_message(&snapshot);
+        let remote = parse_state_message(&text).expect("el estado se entiende");
+
+        assert!(remote.can_toggle);
+        assert!(!remote.can_seek);
+    }
+
+    #[test]
+    fn a_state_without_capabilities_defaults_to_the_session() {
+        let text = serde_json::json!({
+            "type": "state",
+            "has_session": true,
+            "playback_status": "playing",
+            "position_ms": 0,
+            "duration_ms": 0,
+            "playback_rate": 1.0,
+            "title": "Canción",
+            "artist": "Artista",
+        })
+        .to_string();
+
+        let remote = parse_state_message(&text).expect("el estado se entiende");
+
+        assert!(remote.can_toggle);
+        assert!(remote.can_seek);
+    }
+
+    #[test]
     fn state_message_carries_the_playback_rate() {
         let snapshot = Snapshot {
             playback_rate: 1.25,
@@ -262,6 +318,8 @@ mod tests {
         assert_eq!(remote.artist, "");
         assert_eq!(remote.position_ticks, 0);
         assert_eq!(remote.duration_ticks, 0);
+        assert!(!remote.can_toggle);
+        assert!(!remote.can_seek);
     }
 
     fn playing(position_ticks: i64) -> Snapshot {

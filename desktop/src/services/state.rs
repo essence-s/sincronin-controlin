@@ -706,6 +706,28 @@ mod tests {
     }
 
     #[test]
+    fn controller_receives_the_remote_control_capabilities() {
+        let mut h = harness();
+        let now = Instant::now();
+
+        h.service
+            .on_net_event(NetEvent::AssignedRole(Role::Controlador), now);
+
+        let remote = Snapshot {
+            can_toggle: true,
+            can_seek: false,
+            ..playing(0)
+        };
+        h.service
+            .on_net_event(NetEvent::Message(state_message(&remote)), now);
+
+        let shown = h.ui.remote.lock().expect("la UI no está poisoned");
+        let (state, _) = shown.first().expect("se pintó el estado remoto");
+        assert!(state.can_toggle);
+        assert!(!state.can_seek);
+    }
+
+    #[test]
     fn controlled_moved_updates_the_room_and_opens_the_panel() {
         let mut h = harness();
         let now = Instant::now();

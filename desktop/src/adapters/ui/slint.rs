@@ -156,11 +156,14 @@ fn apply_local(ui: &AppWindow, snapshot: &Snapshot, role: Option<Role>) {
 
 /// Vuelca el estado que publica el controlado en la UI del controlador.
 ///
-/// No toca las sesiones ni los controles: el selector y los botones siguen
-/// siendo los del reproductor local del controlador.
+/// No toca las sesiones: el selector sigue siendo el del reproductor local.
+/// Los controles sí reflejan las capacidades del reproductor del controlado,
+/// que es el que va a ejecutar los comandos.
 fn apply_remote(ui: &AppWindow, state: &RemoteState, position_ticks: i64) {
     ui.set_has_session(state.has_session);
     ui.set_playing(state.playback == PlaybackState::Playing);
+    ui.set_can_toggle(state.can_toggle);
+    ui.set_can_seek(state.can_seek);
 
     let titulo = if !state.has_session {
         "Sin reproducción".to_string()

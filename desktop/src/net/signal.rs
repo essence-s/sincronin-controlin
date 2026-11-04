@@ -11,7 +11,7 @@
 
 use std::io;
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use serde_json::Value;
@@ -30,6 +30,23 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Cuanto espera el hilo cuando no hay conexión con el servidor.
 const IDLE_WAIT: Duration = Duration::from_millis(100);
+
+/// La primera espera antes de volver a la sala que se cayó.
+const REJOIN_FIRST: Duration = Duration::from_secs(1);
+
+/// El tope de la espera entre reintentos.
+const REJOIN_MAX: Duration = Duration::from_secs(8);
+
+/// La espera antes del reintento número `attempts`.
+///
+/// Crece al doble y se queda en [`REJOIN_MAX`]: ni un servidor que acaba
+/// de reiniciar tarda ocho segundos en contestar, ni un corte largo se
+/// reintenta cada segundo para siempre.
+fn backoff(attempts: u32) -> Duration {
+    REJOIN_FIRST
+        .saturating_mul(1 << attempts.min(3))
+        .min(REJOIN_MAX)
+}
 
 /// Errores del hilo de señalización.
 #[derive(Debug)]
@@ -92,13 +109,15 @@ pub(crate) fn run(
             send_out(&mut session, out);
         }
 
-        // 3) Sin conexión: esperar a que llegue un comando.
+        // 3) Sin conexión: esperar a que llegue un comando o a que toque
+        //    volver a la sala que se cayó.
         if session.ws.is_none() {
-            match cmd_rx.recv_timeout(IDLE_WAIT) {
+            match cmd_rx.recv_timeout(session.retry_wait()) {
                 Ok(cmd) => handle_command(&mut session, cmd, &peer_tx, &sink),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+            retry_room(&mut session, &peer_tx, &sink);
             continue;
         }
 
@@ -135,10 +154,32 @@ pub(crate) fn run(
         // Si la conexión se corto, se cierra y se sigue escuchando: el
         // usuario puede volver a conectarse cuando el servidor vuelva.
         if let Action::Close(reason) = action {
+            // Si eramos el controlado, la sala no se disuelve: sus
+            // controladores se quedan esperando y se vuelve solo.
+            let mut rejoin = session.rejoin.take();
+            if rejoin.is_none() {
+                rejoin = session.rejoin_intent();
+            }
+
             net::publish_notice(&sink, reason);
             session.forget();
             net::send_peer(&peer_tx, PeerCommand::Stop);
-            net::publish_state(&sink, NetState::Desconectado);
+
+            match rejoin {
+                Some(rejoin) => {
+                    eprintln!(
+                        "[net] se cayó la conexión: vuelvo a la sala {}",
+                        rejoin.room
+                    );
+                    net::publish_state(&sink, NetState::Conectando);
+                    net::publish_notice(
+                        &sink,
+                        "se cayó la conexión: vuelvo a la sala en un momento",
+                    );
+                    session.rejoin = Some(rejoin);
+                }
+                None => net::publish_state(&sink, NetState::Desconectado),
+            }
         }
     }
 
@@ -172,6 +213,28 @@ struct Session {
     controlado: bool,
     /// El identificador del controlado, cuando somos controlador.
     controlled: Option<u64>,
+    /// Si al entrar hay que reclamar el rol de controlado.
+    ///
+    /// Lo pone la vuelta a la sala que se cayó: el que vuelve sigue siendo
+    /// el controlado aunque encuentre gente esperando. Una entrada normal
+    /// lo deja en `false`.
+    claim: bool,
+    /// La sala a la que hay que volver, si se cayó la conexión.
+    rejoin: Option<Rejoin>,
+}
+
+/// La sala a la que hay que volver después de una caída.
+///
+/// La arma la caída de la conexión del controlado: sus controladores se
+/// quedan esperando en la sala, y él vuelve solo. No es polling: la espera
+/// es un plazo que el bucle respeta, y hasta que vence no toca la red.
+struct Rejoin {
+    /// La sala a la que se vuelve.
+    room: String,
+    /// Cuántos reintentos van.
+    attempts: u32,
+    /// Cuándo toca el próximo.
+    at: Instant,
 }
 
 impl Session {
@@ -182,6 +245,8 @@ impl Session {
             room: None,
             controlado: false,
             controlled: None,
+            claim: false,
+            rejoin: None,
         }
     }
 
@@ -192,6 +257,35 @@ impl Session {
         self.room = None;
         self.controlado = false;
         self.controlled = None;
+        self.claim = false;
+        self.rejoin = None;
+    }
+
+    /// La sala a la que hay que volver, si la conexión se cayó.
+    ///
+    /// Solo vuelve el controlado: el controlador no tiene sala propia a la
+    /// que regresar (su sala es la del controlado, y ese es el que se cayó).
+    fn rejoin_intent(&self) -> Option<Rejoin> {
+        if !self.controlado {
+            return None;
+        }
+
+        Some(Rejoin {
+            room: self.room.clone()?,
+            attempts: 0,
+            at: Instant::now() + backoff(0),
+        })
+    }
+
+    /// Cuánto falta para el próximo reintento.
+    ///
+    /// Sin vuelta pendiente, la espera de siempre: el hilo no tiene nada
+    /// que hacer hasta que la UI mande un comando.
+    fn retry_wait(&self) -> Duration {
+        match &self.rejoin {
+            Some(rejoin) => rejoin.at.saturating_duration_since(Instant::now()),
+            None => IDLE_WAIT,
+        }
     }
 
     /// Le avisa a la sala a dónde nos vamos, antes de irnos.
@@ -242,7 +336,7 @@ fn handle_command(session: &mut Session, cmd: Command, peer_tx: &Sender<PeerComm
                 return;
             };
 
-            enter(session, &room, peer_tx, sink);
+            enter(session, &room, peer_tx, sink, false);
         }
         Command::Send(text) => {
             net::send_peer(peer_tx, PeerCommand::Send(text));
@@ -258,7 +352,17 @@ fn handle_command(session: &mut Session, cmd: Command, peer_tx: &Sender<PeerComm
 }
 
 /// Entra a una sala: corta lo que había y abre la conexión nueva.
-fn enter(session: &mut Session, room: &str, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
+///
+/// `claim` dice si hay que reclamar el rol de controlado al entrar: es la
+/// vuelta a la sala que se cayó, donde los controladores esperan. Una
+/// entrada normal a una sala con gente entra como controlador.
+fn enter(
+    session: &mut Session,
+    room: &str,
+    peer_tx: &Sender<PeerCommand>,
+    sink: &Sink,
+    claim: bool,
+) {
     net::publish_state(sink, NetState::Conectando);
 
     eprintln!("[net] pido la sala {room}");
@@ -281,12 +385,54 @@ fn enter(session: &mut Session, room: &str, peer_tx: &Sender<PeerCommand>, sink:
             });
             send_frame(&mut socket, &frame);
             session.ws = Some(socket);
+            // Después de `leave`, que olvida todo: la intención es de esta
+            // entrada, no de la anterior.
+            session.claim = claim;
         }
         Err(err) => {
             net::publish_notice(sink, format!("no se pudo conectar con el servidor: {err}"));
             net::publish_state(sink, NetState::Desconectado);
         }
     }
+}
+
+/// Vuelve solo a la sala que se cayó, si ya toca.
+///
+/// La espera la hace el bucle con [`Session::retry_wait`]: acá solo se
+/// mira el plazo, porque entre medio puede haber llegado un comando.
+fn retry_room(session: &mut Session, peer_tx: &Sender<PeerCommand>, sink: &Sink) {
+    let Some(mut rejoin) = session.rejoin.take() else {
+        return;
+    };
+
+    if Instant::now() < rejoin.at {
+        session.rejoin = Some(rejoin);
+        return;
+    }
+
+    eprintln!(
+        "[net] reintento {} de la sala {}",
+        rejoin.attempts + 1,
+        rejoin.room
+    );
+
+    enter(session, &rejoin.room, peer_tx, sink, true);
+
+    if session.ws.is_some() {
+        // El servidor contestó: `joined` confirma la sala y desarma la
+        // vuelta. Si la conexión se cae antes, se reintenta enseguida.
+        rejoin.attempts += 1;
+        rejoin.at = Instant::now();
+        session.rejoin = Some(rejoin);
+        return;
+    }
+
+    // Sin servidor: se vuelve a probar, con más espera. `enter` avisó que
+    // quedó desconectado, pero para el usuario la sala sigue en pie.
+    rejoin.attempts += 1;
+    rejoin.at = Instant::now() + backoff(rejoin.attempts);
+    session.rejoin = Some(rejoin);
+    net::publish_state(sink, NetState::Conectando);
 }
 
 /// Abre el WebSocket contra el servidor y entra a la sala.
@@ -349,10 +495,18 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
         ServerMessage::Joined { room, id, peers } => {
             session.our_id = Some(id);
             session.room = Some(room.clone());
+            // La sala ya está confirmada: no hay más que reintentar.
+            session.rejoin = None;
+
             // El primero de la sala es el controlado. El que llega después
             // es controlador, y espera que el controlado le ofrezca: no
             // hay que mirar quién tiene el identificador más chico.
-            session.controlado = peers.is_empty();
+            //
+            // La excepción es la vuelta: el controlado que se cayó y vuelve
+            // a su sala reclama el rol aunque haya gente esperando. Si no,
+            // entraría como controlador y nadie de la sala le ofrecería.
+            let claim = std::mem::take(&mut session.claim);
+            session.controlado = peers.is_empty() || claim;
 
             net::publish_notice(sink, format!("en la sala {room}"));
 
@@ -362,6 +516,13 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
             if session.controlado {
                 eprintln!("[net] esperando a que otro equipo entre en la sala {room}");
                 net::publish_role(sink, Role::Controlado);
+
+                // Al volver, los que están son los que esperaban: se les
+                // ofrece a cada uno, porque cada uno tiene su canal.
+                for peer in peers {
+                    eprintln!("[net] le ofrezco la conexión al equipo {peer}");
+                    net::send_peer(peer_tx, PeerCommand::MakeOffer { peer });
+                }
             } else {
                 eprintln!("[net] en la sala ya estaban: {peers:?}");
                 net::publish_role(sink, Role::Controlador);
@@ -383,12 +544,15 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
             eprintln!("[net] se fue el otro equipo (id {peer})");
 
             // Si el que se fue es el controlado, en esta sala ya no hay a
-            // quién controlar: se suelta y se avisa.
+            // quién controlar: se cae el par y se espera. La sala no se
+            // disuelve porque el controlado puede volver solo y ofrecer de
+            // nuevo; si no vuelve, el usuario entra a otra desde el panel.
             if !session.controlado && session.controlled == Some(peer) {
                 net::publish_controlled_left(sink);
                 net::send_peer(peer_tx, PeerCommand::Stop);
-                session.leave();
-                net::publish_state(sink, NetState::Desconectado);
+                session.controlled = None;
+                net::publish_state(sink, NetState::Conectando);
+                net::publish_notice(sink, "el controlado se fue: esperando que vuelva");
                 return;
             }
 
@@ -472,7 +636,7 @@ fn handle_relay(
 
             // Y se lo sigue solo: el aviso ya trajo el código, así que no
             // hay que apretar nada.
-            enter(session, &room, peer_tx, sink);
+            enter(session, &room, peer_tx, sink, false);
         }
         // El join y el leave los maneja el servidor, no el par.
         ClientMessage::Join { .. } | ClientMessage::Leave => {}
@@ -506,5 +670,132 @@ fn send_frame(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, frame: &Frame<C
 
     if let Err(err) = socket.send(tungstenite::Message::text(text)) {
         eprintln!("[net] no se pudo mandar un mensaje: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::net::Event;
+
+    /// Un sink que anota los eventos, y el registro.
+    fn recording_sink() -> (Sink, Arc<Mutex<Vec<Event>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let sink: Sink = Arc::new(move |event| {
+            recorded
+                .lock()
+                .expect("el registro no está poisoned")
+                .push(event);
+        });
+
+        (sink, events)
+    }
+
+    /// El mensaje con el que el servidor confirma la entrada a una sala.
+    fn joined(room: &str, id: u64, peers: &[u64]) -> String {
+        let frame = Frame::new(ServerMessage::Joined {
+            room: room.to_string(),
+            id,
+            peers: peers.to_vec(),
+        });
+
+        serde_json::to_string(&frame).expect("el sobre se serializa")
+    }
+
+    /// Las ofertas que pidió el hilo de par, ordenadas.
+    fn offers(rx: &Receiver<PeerCommand>) -> Vec<u64> {
+        let mut offered = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                PeerCommand::MakeOffer { peer } => offered.push(peer),
+                other => panic!("no era una oferta: {other:?}"),
+            }
+        }
+        offered.sort_unstable();
+        offered
+    }
+
+    /// Una entrada normal a una sala con gente: controlador, y no ofrece
+    /// nada.
+    #[test]
+    fn a_client_that_joins_a_room_with_people_is_a_controller() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        handle_server(&mut session, &joined("ABC234", 9, &[3, 5]), &peer_tx, &sink);
+
+        assert!(
+            !session.controlado,
+            "con gente en la sala se entra como controlador"
+        );
+        assert!(offers(&peer_rx).is_empty(), "el controlador no ofrece");
+
+        let recorded = events.lock().expect("el registro no está poisoned").clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::AssignedRole(Role::Controlador))),
+            "falta el rol de controlador: {recorded:?}"
+        );
+    }
+
+    /// El controlado que vuelve a su sala la reclama: no entra como
+    /// controlador aunque los que esperan sigan ahí.
+    #[test]
+    fn the_controlado_that_comes_back_claims_its_room() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        // La vuelta: la conexión se armó con la intención de reclamar.
+        session.claim = true;
+
+        handle_server(&mut session, &joined("ABC234", 9, &[3, 5]), &peer_tx, &sink);
+
+        assert!(
+            session.controlado,
+            "el que vuelve sigue siendo el controlado"
+        );
+        assert!(!session.claim, "la intención se consume");
+        assert_eq!(
+            offers(&peer_rx),
+            vec![3, 5],
+            "le ofrece a cada uno de los que esperaban"
+        );
+
+        let recorded = events.lock().expect("el registro no está poisoned").clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::AssignedRole(Role::Controlado))),
+            "falta el rol de controlado: {recorded:?}"
+        );
+    }
+
+    /// Solo el controlado vuelve a su sala: el controlador no tiene a qué.
+    #[test]
+    fn only_the_controlado_has_a_room_to_come_back_to() {
+        let mut session = Session::new();
+        session.room = Some("ABC234".to_string());
+        assert!(session.rejoin_intent().is_none());
+
+        session.controlado = true;
+        let rejoin = session.rejoin_intent().expect("el controlado vuelve");
+        assert_eq!(rejoin.room, "ABC234");
+    }
+
+    /// La espera crece y se queda en el tope.
+    #[test]
+    fn the_rejoin_wait_grows_and_stops_at_the_top() {
+        assert_eq!(backoff(0), REJOIN_FIRST);
+        assert_eq!(backoff(1), Duration::from_secs(2));
+        assert_eq!(backoff(2), Duration::from_secs(4));
+        assert_eq!(backoff(3), REJOIN_MAX);
+        assert_eq!(backoff(9), REJOIN_MAX);
     }
 }

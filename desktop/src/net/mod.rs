@@ -125,7 +125,8 @@ pub enum Event {
         /// La sala en la que está ahora.
         room: String,
     },
-    /// El controlado se fue sin decir a dónde: la sala quedó sin controlado.
+    /// El controlado se fue sin decir a dónde: la sala quedó sin controlado
+    /// y el cliente se queda en ella esperando que vuelva.
     ControlledLeft,
 }
 
@@ -676,9 +677,9 @@ mod tests {
     }
 
     /// Si el controlado se va sin decir a dónde, el controlador lo sabe y
-    /// suelta la sala: no queda esperando a alguien que no va a volver.
+    /// se queda en la sala: es ahí donde el controlado vuelve solo.
     #[test]
-    fn the_controller_leaves_the_room_when_the_controlado_disappears() {
+    fn the_controller_waits_in_the_room_when_the_controlado_disappears() {
         let _ = test_server();
 
         let (cmd_a, events_a) = client();
@@ -704,15 +705,24 @@ mod tests {
             .expect("el canal de comandos está abierto");
 
         wait_for(&events_b, |events| {
-            let gone = events
+            events
                 .iter()
-                .position(|event| matches!(event, Event::ControlledLeft));
-            gone.is_some_and(|index| {
-                events[index..]
-                    .iter()
-                    .any(|event| matches!(event, Event::State(NetState::Desconectado)))
-            })
+                .any(|event| matches!(event, Event::ControlledLeft))
         });
+
+        // Y no se va de la sala: la etiqueta queda esperando, no
+        // desconectada.
+        std::thread::sleep(Duration::from_millis(500));
+        let received = events_b
+            .lock()
+            .expect("el registro no está poisoned")
+            .clone();
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::State(NetState::Desconectado))),
+            "el controlador no tenía que salir de la sala: {received:?}"
+        );
     }
 
     /// El servidor STUN contestó a los dos: anuncia la dirección pública.

@@ -575,9 +575,11 @@ fn apply_net(
             ui.set_peer_room("".into());
             open_panel(ui);
         }
-        // Sin destino, la sala quedó sin controlado: se puede entrar a otra.
+        // Sin destino, la sala quedó sin controlado. El cliente sigue en
+        // ella esperando que el controlado vuelva solo; para irse a otra, se
+        // escribe el código en el panel.
         net::Event::ControlledLeft => {
-            append_log(ui, "· el controlado se fue: la sala quedó sin controlado");
+            append_log(ui, "· el controlado se fue: esperando que vuelva");
             ui.set_peer_room("".into());
             open_panel(ui);
         }

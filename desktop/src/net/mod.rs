@@ -137,22 +137,43 @@ pub type Sink = Arc<dyn Fn(Event) + Send + Sync + 'static>;
 /// Lo que el hilo de señalización le manda al hilo de par.
 #[derive(Debug)]
 pub(crate) enum PeerCommand {
-    /// Crear la sesión: el `Rtc` y el socket UDP.
-    Start {
-        /// Identificador del cliente en el servidor.
-        id: u64,
+    /// Mandar la oferta a un equipo.
+    ///
+    /// Si todavía no hay par con él, el hilo lo abre: el controlado abre
+    /// uno por controlador.
+    MakeOffer {
+        /// Identificador del equipo al que va la oferta.
+        peer: u64,
     },
-    /// Mandar la oferta.
-    MakeOffer,
-    /// Aceptar una oferta y mandar la respuesta.
-    AcceptOffer(Value),
-    /// Aceptar la respuesta a nuestra oferta.
-    AcceptAnswer(Value),
-    /// Un candidato ICE del otro equipo.
-    AddIce(Value),
-    /// Mandar un mensaje por el canal de datos.
+    /// Aceptar la oferta de un equipo y mandar la respuesta.
+    AcceptOffer {
+        /// Identificador del equipo que ofreció.
+        peer: u64,
+        /// La oferta tal cual llegó.
+        sdp: Value,
+    },
+    /// Aceptar la respuesta de un equipo a nuestra oferta.
+    AcceptAnswer {
+        /// Identificador del equipo que contestó.
+        peer: u64,
+        /// La respuesta tal cual llegó.
+        sdp: Value,
+    },
+    /// Un candidato ICE de un equipo.
+    AddIce {
+        /// Identificador del equipo que lo mandó.
+        peer: u64,
+        /// El candidato tal cual llegó.
+        candidate: Value,
+    },
+    /// Mandar un mensaje por todos los canales abiertos.
     Send(String),
-    /// Terminar la sesión.
+    /// Cerrar el par de un equipo: se fue de la sala.
+    Close {
+        /// Identificador del equipo que se fue.
+        peer: u64,
+    },
+    /// Terminar todos los pares.
     Stop,
 }
 
@@ -160,11 +181,26 @@ pub(crate) enum PeerCommand {
 #[derive(Debug)]
 pub(crate) enum PeerOut {
     /// La oferta, para mandarla por el WebSocket.
-    Offer(Value),
+    Offer {
+        /// A quién va.
+        to: u64,
+        /// El SDP.
+        sdp: Value,
+    },
     /// La respuesta, para mandarla por el WebSocket.
-    Answer(Value),
+    Answer {
+        /// A quién va.
+        to: u64,
+        /// El SDP.
+        sdp: Value,
+    },
     /// Un candidato ICE local, para mandarlo por el WebSocket.
-    Ice(Value),
+    Ice {
+        /// A quién va.
+        to: u64,
+        /// El candidato.
+        candidate: Value,
+    },
 }
 
 /// Levanta los dos hilos de red.
@@ -367,6 +403,14 @@ mod tests {
     const FOLLOW_NEW_ROOM: &str = "F6G8HJ";
     const FOLLOW_FROM_ROOM: &str = "K2M4NP";
     const FOLLOW_TO_ROOM: &str = "Q6R8ST";
+
+    /// Las salas de las pruebas de varios controladores: cada test usa las
+    /// suyas.
+    const TWO_CONTROLLERS_ROOM: &str = "B4D6FH";
+    const THREE_ROOM_A: &str = "D7F9HJ";
+    const THREE_ROOM_OTHER: &str = "E2G4KM";
+    const THREE_FOLLOW_FROM_ROOM: &str = "F8H2KN";
+    const THREE_FOLLOW_TO_ROOM: &str = "G3J5MP";
 
     /// Las salas de las pruebas de traspaso: cada test usa las suyas.
     const HANDOFF_ROOM_A: &str = "R3T5VW";
@@ -980,6 +1024,16 @@ mod tests {
         )
     }
 
+    /// Cuántos canales de datos abrió el cliente.
+    fn channels_opened(events: &[Event]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, Event::Notice(text) if text.contains("canal de datos abierto"))
+            })
+            .count()
+    }
+
     /// El servidor de pruebas: se levanta una sola vez y lo usan todas
     /// las pruebas.
     fn test_server() -> &'static str {
@@ -1136,6 +1190,199 @@ mod tests {
                 |event| matches!(event, Event::AssignedRole(role) if *role == Role::Controlado),
             )
         });
+    }
+
+    /// Dos controladores a la vez: cada uno con su canal contra el
+    /// controlado, y los dos viendo lo mismo.
+    #[test]
+    fn two_controllers_see_the_controlado_at_once() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_d, events_d) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: TWO_CONTROLLERS_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+
+        cmd_b
+            .send(Command::Connect {
+                room: TWO_CONTROLLERS_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_b, channel_opened);
+
+        cmd_d
+            .send(Command::Connect {
+                room: TWO_CONTROLLERS_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_d, channel_opened);
+
+        // El controlado abre uno por controlador.
+        wait_for(&events_a, |events| channels_opened(events) == 2);
+
+        // Lo que manda el controlado les llega a los dos.
+        cmd_a
+            .send(Command::Send("hola".to_string()))
+            .expect("el canal de comandos está abierto");
+
+        for events in [&events_b, &events_d] {
+            wait_for(events, |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::Message(text) if text == "hola"))
+            });
+        }
+
+        // Y ninguno abrió un segundo canal: no se conectan entre ellos.
+        for (name, events) in [("B", &events_b), ("D", &events_d)] {
+            let opened = channels_opened(&events.lock().expect("el registro no está poisoned"));
+            assert_eq!(opened, 1, "{name} tenía que tener un solo canal");
+        }
+    }
+
+    /// Si un controlador se va a otra sala, el que se queda no pierde el
+    /// canal ni el estado.
+    #[test]
+    fn the_controlado_keeps_the_other_controller_when_one_leaves() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_d, events_d) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: THREE_ROOM_A.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+
+        cmd_b
+            .send(Command::Connect {
+                room: THREE_ROOM_A.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_b, channel_opened);
+
+        cmd_d
+            .send(Command::Connect {
+                room: THREE_ROOM_A.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_d, channel_opened);
+        wait_for(&events_a, |events| channels_opened(events) == 2);
+
+        // B se va a una sala propia.
+        cmd_b
+            .send(Command::Connect {
+                room: THREE_ROOM_OTHER.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        // El controlado lo ve irse y sigue conectado.
+        wait_for(&events_a, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Notice(text) if text.contains("se fue")))
+        });
+
+        // El canal que le queda sigue andando.
+        cmd_a
+            .send(Command::Send("sigue".to_string()))
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_d, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "sigue"))
+        });
+
+        // Y a ninguno le apareció una conexión caída.
+        for (name, events) in [("A", &events_a), ("D", &events_d)] {
+            let seen = events.lock().expect("el registro no está poisoned").clone();
+            assert!(
+                !seen
+                    .iter()
+                    .any(|event| matches!(event, Event::Notice(text) if text.contains("falló"))),
+                "{name} no tenía que ver una conexión caída: {seen:?}"
+            );
+            assert!(
+                !seen
+                    .iter()
+                    .any(|event| matches!(event, Event::State(NetState::Desconectado))),
+                "{name} no tenía que quedar desconectado: {seen:?}"
+            );
+        }
+    }
+
+    /// El controlador que siguió a la sala nueva maneja al controlado
+    /// nuevo, y al viejo no le llega nada.
+    #[test]
+    fn a_controller_that_follows_drives_the_new_controlado() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        // A es el controlado de su sala, con B de controlador.
+        cmd_a
+            .send(Command::Connect {
+                room: THREE_FOLLOW_FROM_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+
+        cmd_b
+            .send(Command::Connect {
+                room: THREE_FOLLOW_FROM_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_b, channel_opened);
+
+        // C es el controlado de la sala nueva.
+        cmd_c
+            .send(Command::Connect {
+                room: THREE_FOLLOW_TO_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, is_controlado);
+
+        // A se muda: B lo sigue y queda de controlador de C.
+        cmd_a
+            .send(Command::Connect {
+                room: THREE_FOLLOW_TO_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_b, |events| channels_opened(events) == 2);
+
+        // Y lo que mueve le llega al controlado nuevo.
+        cmd_b
+            .send(Command::Send("play".to_string()))
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "play"))
+        });
+
+        // Al controlado viejo no: ya no habla con B.
+        std::thread::sleep(Duration::from_millis(500));
+        let seen = events_a
+            .lock()
+            .expect("el registro no está poisoned")
+            .clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "play")),
+            "el controlado viejo no tenía que recibir nada: {seen:?}"
+        );
     }
 
     /// El segundo en una sala ocupada es el controlador.

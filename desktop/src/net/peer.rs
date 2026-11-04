@@ -27,6 +27,13 @@
 //! TURN, que no se usa). Sin respuesta igual queda el aviso en el
 //! registro del panel.
 //!
+//! ## Un par por equipo
+//!
+//! El controlado sostiene un par por cada controlador de su sala, cada uno
+//! con su socket y su STUN. El controlador tiene uno solo, contra el
+//! controlado: solo el controlado ofrece, así que dos controladores nunca
+//! abren un par entre sí.
+//!
 //! ## Lo que cuenta el ICE
 //!
 //! El estado del ICE también desembolsa un aviso del panel: si la
@@ -35,6 +42,8 @@
 //! rehacer suele ser pasajero. Si la conexión vuelve, sale el aviso de
 //! la vuelta.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
@@ -88,8 +97,10 @@ const STUN_MAPPED_ATTR: u16 = 0x0020;
 /// La magic cookie del RFC 5389.
 pub(crate) const STUN_MAGIC: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 
-/// La sesión punto a punto.
+/// El par con un equipo: el controlado sostiene uno por controlador.
 struct Session {
+    /// El equipo con el que es este par.
+    peer: u64,
     /// El estado de WebRTC.
     rtc: Rtc,
     /// El socket UDP.
@@ -137,102 +148,156 @@ pub(crate) fn run(
     out_tx: Sender<PeerOut>,
     sink: Sink,
 ) -> Result<(), RtcError> {
-    let mut session: Option<Session> = None;
+    let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut buf: Vec<u8> = Vec::new();
 
     loop {
         // 1) Los comandos que ya están esperando.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if !handle_command(cmd, &mut session, &out_tx, &sink) {
+            if !handle_command(cmd, &mut sessions, &out_tx, &sink) {
                 break;
             }
         }
 
-        // 2) Sin sesión no hay nada que hacer: esperar un comando.
-        let Some(current) = session.as_mut() else {
+        // 2) Sin pares no hay nada que hacer: esperar un comando.
+        if sessions.is_empty() {
             match cmd_rx.recv_timeout(IDLE_WAIT) {
                 Ok(cmd) => {
-                    handle_command(cmd, &mut session, &out_tx, &sink);
+                    handle_command(cmd, &mut sessions, &out_tx, &sink);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             continue;
-        };
+        }
 
-        // El binding STUN se reenvía si le toca: no depende de str0m.
-        maintain_stun(current, &sink);
+        // 3) La salida de cada par: el binding STUN y el bucle de str0m.
+        let mut earliest = Instant::now() + MAX_WAIT;
+        let mut broken: Vec<u64> = Vec::new();
 
-        // 3) El bucle de str0m. Antes, el reenvío del binding STUN: no
-        // depende de str0m, se dispara solo por el reloj.
-        let timeout = match current.rtc.poll_output() {
-            Ok(Output::Timeout(v)) => v,
-            Ok(Output::Transmit(v)) => {
-                if let Err(err) = current.socket.send_to(&v.contents, v.destination) {
-                    eprintln!("[net] no se pudo mandar el paquete: {err}");
+        for current in sessions.values_mut() {
+            // El binding STUN se reenvía si le toca: no depende de str0m.
+            maintain_stun(current, &sink);
+
+            match pump(current, &sink) {
+                Ok(at) => earliest = earliest.min(at),
+                Err(err) => {
+                    eprintln!(
+                        "[net] error de WebRTC con el equipo {}: {err}",
+                        current.peer
+                    );
+                    broken.push(current.peer);
                 }
-                continue;
             }
-            Ok(Output::Event(v)) => {
-                handle_event(v, current, &sink);
-                continue;
-            }
-            Err(err) => {
-                eprintln!("[net] error de WebRTC: {err}");
-                break;
-            }
-        };
+        }
 
-        let remaining = timeout.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            current.rtc.handle_input(Input::Timeout(Instant::now()))?;
+        for peer in broken {
+            sessions.remove(&peer);
+        }
+        if sessions.is_empty() {
             continue;
         }
 
-        // El socket espera lo que falta para el timeout de str0m, pero no
-        // más de MAX_WAIT: los comandos de la UI no pueden quedar
-        // esperando segundos.
-        let wait = remaining.min(MAX_WAIT);
-        current.socket.set_read_timeout(Some(wait))?;
+        // 4) Un datagrama de cada socket, con un plazo corto.
+        //
+        // Con varios pares no se puede esperar en uno solo: el plazo se
+        // reparte entre todos, y así ninguno se queda con el hilo mientras
+        // los demás tienen algo para leer.
+        let wait = earliest.saturating_duration_since(Instant::now());
+        let slice = (wait / sessions.len() as u32)
+            .min(MAX_WAIT)
+            .max(Duration::from_millis(1));
 
-        // El buffer tiene que estar listo antes de recibir: con un buffer
-        // vacío el datagram se trunca a cero bytes.
-        buf.resize(BUFFER_SIZE, 0);
-
-        let input = match current.socket.recv_from(&mut buf) {
-            Ok((n, source)) => {
-                buf.truncate(n);
-
-                // Si es la respuesta a nuestro binding STUN, la maneja el
-                // hilo de par: no llega al `Rtc`.
-                if handle_stun_reply(current, source, &buf, &out_tx, &sink) {
-                    continue;
-                }
-
-                Input::Receive(
-                    Instant::now(),
-                    Receive {
-                        proto: Protocol::Udp,
-                        source,
-                        destination: current.socket.local_addr()?,
-                        contents: buf.as_slice().try_into()?,
-                    },
-                )
+        let mut failed: Vec<u64> = Vec::new();
+        for current in sessions.values_mut() {
+            if let Err(err) = read_once(current, slice, &mut buf, &out_tx, &sink) {
+                eprintln!(
+                    "[net] error en el socket del equipo {}: {err}",
+                    current.peer
+                );
+                failed.push(current.peer);
             }
-            // Se cumplio el timeout del socket. Si el de str0m todavía no
-            // vencio, solo seguimos esperando: no hay nada que avisarle.
-            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if remaining <= MAX_WAIT {
-                    Input::Timeout(Instant::now())
-                } else {
-                    continue;
-                }
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        current.rtc.handle_input(input)?;
+        }
+        for peer in failed {
+            sessions.remove(&peer);
+        }
     }
+
+    Ok(())
+}
+
+/// Drena la salida de str0m y devuelve cuándo hay que despertarlo.
+///
+/// Si el instante que pide ya pasó, le pasa el timeout y vuelve a
+/// preguntar: cada par avanza con su propio reloj.
+fn pump(current: &mut Session, sink: &Sink) -> Result<Instant, RtcError> {
+    loop {
+        match current.rtc.poll_output()? {
+            Output::Timeout(at) => {
+                let now = Instant::now();
+                if at > now {
+                    return Ok(at);
+                }
+                current.rtc.handle_input(Input::Timeout(now))?;
+            }
+            Output::Transmit(transmit) => {
+                if let Err(err) = current
+                    .socket
+                    .send_to(&transmit.contents, transmit.destination)
+                {
+                    eprintln!("[net] no se pudo mandar el paquete: {err}");
+                }
+            }
+            Output::Event(event) => handle_event(event, current, sink),
+        }
+    }
+}
+
+/// Espera un datagrama en el socket del par y se lo pasa a str0m.
+///
+/// Si el plazo se cumple sin nada, no hay nada que avisarle: el `pump` de
+/// la vuelta siguiente ve si ya le tocaba despertarse.
+fn read_once(
+    current: &mut Session,
+    wait: Duration,
+    buf: &mut Vec<u8>,
+    out_tx: &Sender<PeerOut>,
+    sink: &Sink,
+) -> Result<(), RtcError> {
+    current.socket.set_read_timeout(Some(wait))?;
+
+    // El buffer tiene que estar listo antes de recibir: con un buffer
+    // vacío el datagram se trunca a cero bytes.
+    buf.resize(BUFFER_SIZE, 0);
+
+    let input = match current.socket.recv_from(buf) {
+        Ok((n, source)) => {
+            buf.truncate(n);
+
+            // Si es la respuesta a nuestro binding STUN, la maneja el
+            // hilo de par: no llega al `Rtc`.
+            if handle_stun_reply(current, source, buf, out_tx, sink) {
+                return Ok(());
+            }
+
+            Input::Receive(
+                Instant::now(),
+                Receive {
+                    proto: Protocol::Udp,
+                    source,
+                    destination: current.socket.local_addr()?,
+                    contents: buf.as_slice().try_into()?,
+                },
+            )
+        }
+        // Se cumplio el timeout del socket: no hay nada para str0m.
+        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    current.rtc.handle_input(input)?;
 
     Ok(())
 }
@@ -427,92 +492,112 @@ fn mapped_from_attr(attr: &[u8]) -> StunReply {
 /// escribir otra vez.
 fn handle_command(
     cmd: PeerCommand,
-    session: &mut Option<Session>,
+    sessions: &mut HashMap<u64, Session>,
     out_tx: &Sender<PeerOut>,
     sink: &Sink,
 ) -> bool {
     match cmd {
-        PeerCommand::Start { id } => {
-            // La sesión se crea una sola vez: si ya hay una, se deja.
-            if session.is_none() {
-                eprintln!("[net] se abre la sesión (id {id})");
-                match start() {
-                    Ok(new) => {
-                        *session = Some(new);
-                    }
-                    Err(err) => {
-                        eprintln!("[net] no se pudo abrir el socket: {err}");
-                        net::publish_notice(sink, format!("no se pudo abrir el socket UDP: {err}"));
-                    }
-                }
-            }
-            true
-        }
-        PeerCommand::MakeOffer => {
-            if let Some(current) = session.as_mut() {
-                if current.offered {
-                    // Ya se ofrecio: no se ofrece dos veces.
-                    return true;
-                }
-                current.offered = true;
+        PeerCommand::MakeOffer { peer } => {
+            let Some(current) = session_for(sessions, peer, sink) else {
+                return true;
+            };
 
-                if let Err(err) = make_offer(current, out_tx) {
-                    eprintln!("[net] no se pudo hacer la oferta: {err}");
-                    net::publish_notice(sink, format!("no se pudo hacer la oferta: {err}"));
-                }
+            if current.offered {
+                // Ya se ofrecio: no se ofrece dos veces.
+                return true;
+            }
+            current.offered = true;
+
+            if let Err(err) = make_offer(current, out_tx) {
+                eprintln!("[net] no se pudo hacer la oferta: {err}");
+                net::publish_notice(sink, format!("no se pudo hacer la oferta: {err}"));
             }
             true
         }
-        PeerCommand::AcceptOffer(sdp) => {
-            if let Some(current) = session.as_mut() {
-                if let Err(err) = accept_offer(current, &sdp, out_tx) {
-                    eprintln!("[net] no se pudo aceptar la oferta: {err}");
-                    net::publish_notice(sink, format!("no se pudo aceptar la oferta: {err}"));
-                }
+        PeerCommand::AcceptOffer { peer, sdp } => {
+            let Some(current) = session_for(sessions, peer, sink) else {
+                return true;
+            };
+
+            if let Err(err) = accept_offer(current, &sdp, out_tx) {
+                eprintln!("[net] no se pudo aceptar la oferta: {err}");
+                net::publish_notice(sink, format!("no se pudo aceptar la oferta: {err}"));
             }
             true
         }
-        PeerCommand::AcceptAnswer(sdp) => {
-            if let Some(current) = session.as_mut() {
-                if let Err(err) = accept_answer(current, &sdp) {
-                    eprintln!("[net] no se pudo aceptar la respuesta: {err}");
-                    net::publish_notice(sink, format!("no se pudo aceptar la respuesta: {err}"));
-                }
+        PeerCommand::AcceptAnswer { peer, sdp } => {
+            let Some(current) = sessions.get_mut(&peer) else {
+                return true;
+            };
+
+            if let Err(err) = accept_answer(current, &sdp) {
+                eprintln!("[net] no se pudo aceptar la respuesta: {err}");
+                net::publish_notice(sink, format!("no se pudo aceptar la respuesta: {err}"));
             }
             true
         }
-        PeerCommand::AddIce(value) => {
-            if let Some(current) = session.as_mut() {
-                match serde_json::from_value::<Candidate>(value) {
-                    Ok(candidate) => {
-                        current.rtc.add_remote_candidate(candidate);
-                    }
-                    Err(err) => {
-                        eprintln!("[net] candidato ICE que no se entiende: {err}");
-                    }
+        PeerCommand::AddIce { peer, candidate } => {
+            let Some(current) = sessions.get_mut(&peer) else {
+                return true;
+            };
+
+            match serde_json::from_value::<Candidate>(candidate) {
+                Ok(candidate) => {
+                    current.rtc.add_remote_candidate(candidate);
+                }
+                Err(err) => {
+                    eprintln!("[net] candidato ICE que no se entiende: {err}");
                 }
             }
             true
         }
         PeerCommand::Send(text) => {
-            if let Some(current) = session.as_mut() {
+            for current in sessions.values_mut() {
                 send_message(current, &text, sink);
             }
             // Después de escribir hay que pasar por `poll_output` antes
             // de escribir otra vez.
             false
         }
+        PeerCommand::Close { peer } => {
+            // Se cae el par de ese equipo: su socket se cierra y los demás
+            // siguen como estaban.
+            sessions.remove(&peer);
+            true
+        }
         PeerCommand::Stop => {
-            // Se cae la sesión: el socket se cierra y la proxima vez se
-            // abre de cero.
-            *session = None;
+            // Se sale de la sala: se caen todos los pares.
+            sessions.clear();
             true
         }
     }
 }
 
+/// El par con un equipo; si todavía no hay, lo abre.
+fn session_for<'a>(
+    sessions: &'a mut HashMap<u64, Session>,
+    peer: u64,
+    sink: &Sink,
+) -> Option<&'a mut Session> {
+    match sessions.entry(peer) {
+        Entry::Occupied(current) => Some(current.into_mut()),
+        Entry::Vacant(slot) => {
+            eprintln!("[net] se abre el par con el equipo {peer}");
+
+            match start(peer) {
+                Ok(new) => Some(slot.insert(new)),
+                Err(err) => {
+                    eprintln!("[net] no se pudo abrir el socket: {err}");
+                    net::publish_notice(sink, format!("no se pudo abrir el socket UDP: {err}"));
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Abre el socket UDP y prepara el `Rtc`.
-fn start() -> io::Result<Session> {
+fn start(peer: u64) -> io::Result<Session> {
     let socket = UdpSocket::bind(local_address()?)?;
     let local_addr = socket.local_addr()?;
 
@@ -525,6 +610,7 @@ fn start() -> io::Result<Session> {
     let stun = start_stun(&socket, local_addr);
 
     Ok(Session {
+        peer,
         rtc,
         socket,
         pending: None,
@@ -657,7 +743,10 @@ fn make_offer(current: &mut Session, out_tx: &Sender<PeerOut>) -> Result<(), Rtc
     current.pending = Some(pending);
 
     let value = serde_json::to_value(&offer).expect("el SDP se serializa");
-    let _ = out_tx.send(PeerOut::Offer(value));
+    let _ = out_tx.send(PeerOut::Offer {
+        to: current.peer,
+        sdp: value,
+    });
     eprintln!("[net] mandé la oferta");
 
     // Los candidatos van después del SDP: es trickle ICE puro.
@@ -678,7 +767,10 @@ fn accept_offer(
     let answer = current.rtc.sdp_api().accept_offer(offer)?;
 
     let value = serde_json::to_value(&answer).expect("el SDP se serializa");
-    let _ = out_tx.send(PeerOut::Answer(value));
+    let _ = out_tx.send(PeerOut::Answer {
+        to: current.peer,
+        sdp: value,
+    });
     eprintln!("[net] acepté la oferta y mandé la respuesta");
 
     // Los candidatos van después del SDP: es trickle ICE puro.
@@ -733,7 +825,10 @@ fn add_and_send_local_candidate(
 
     match serde_json::to_value(stored) {
         Ok(value) => {
-            let _ = out_tx.send(PeerOut::Ice(value));
+            let _ = out_tx.send(PeerOut::Ice {
+                to: current.peer,
+                candidate: value,
+            });
         }
         Err(err) => eprintln!("[net] no se pudo serializar el candidato local: {err}"),
     }
@@ -872,6 +967,7 @@ mod tests {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("socket de pruebas");
 
         Session {
+            peer: 0,
             rtc: Rtc::new(Instant::now()),
             socket,
             pending: None,

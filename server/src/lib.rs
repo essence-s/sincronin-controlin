@@ -220,9 +220,33 @@ fn handle_incoming(
             eprintln!("[señal] sala {room}: el cliente {id} se va");
             false
         }
-        // Cualquier otra cosa se reenvía en crudo a los demas de la sala.
-        // El servidor no interpreta el contenido: no necesita saber que
-        // es un SDP para reenviarlo.
+        // La señalización de un par va solo a ese par: con varios
+        // controladores en la sala, la oferta o la respuesta de uno no le
+        // sirve al otro. El servidor no mira el contenido, solo el
+        // destinatario.
+        "offer" | "answer" | "ice" => {
+            let Some(to) = value.get("to").and_then(serde_json::Value::as_u64) else {
+                eprintln!("[señal] sala {room}: el cliente {id} manda {kind} sin destinatario");
+                return true;
+            };
+
+            let delivered = state.rooms.send_to(
+                room,
+                to,
+                message(&ServerMessage::Relay {
+                    peer: id,
+                    message: value,
+                }),
+            );
+
+            if !delivered {
+                eprintln!("[señal] sala {room}: el cliente {id} le habla a {to}, que no está");
+            }
+            true
+        }
+        // Cualquier otra cosa se reenvía en crudo a los demas de la sala
+        // (el aviso de mudanza, por ejemplo). El servidor no interpreta el
+        // contenido: no necesita saber que es un SDP para reenviarlo.
         _ => {
             state.rooms.broadcast(
                 room,

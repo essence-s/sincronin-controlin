@@ -79,6 +79,26 @@ impl Rooms {
         left
     }
 
+    /// Le manda un mensaje a un cliente de la sala.
+    ///
+    /// Devuelve si lo entregó: un destinatario que no está en la sala no
+    /// recibe nada, y el servidor no inventa destinos.
+    pub fn send_to(&self, room: &str, to: u64, message: Message) -> bool {
+        let rooms = self.rooms.lock().unwrap_or_else(|err| err.into_inner());
+
+        let Some(clients) = rooms.get(room) else {
+            return false;
+        };
+
+        for client in clients {
+            if client.id == to {
+                return client.tx.send(message).is_ok();
+            }
+        }
+
+        false
+    }
+
     /// Le manda un mensaje a todos los de la sala menos a uno.
     ///
     /// El que queda excluido es el propio emisor: no tiene que recibir
@@ -147,6 +167,29 @@ mod tests {
 
         // La sala sigue viva.
         assert_eq!(rooms.join("ABC123", client(3)), vec![2]);
+    }
+
+    #[test]
+    fn relaying_to_one_peer_skips_the_rest() {
+        let rooms = Rooms::new();
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+
+        rooms.join("ABC123", Client { id: 1, tx: tx_a });
+        rooms.join("ABC123", Client { id: 2, tx: tx_b });
+
+        assert!(rooms.send_to("ABC123", 2, Message::text("hola")));
+
+        let received = rx_b.try_recv().expect("el destinatario recibe el mensaje");
+        assert_eq!(received.to_text().expect("era texto"), "hola");
+        assert!(
+            rx_a.try_recv().is_err(),
+            "el que no es destinatario no recibe nada"
+        );
+
+        // Un destinatario que no está en la sala no recibe nada, y el
+        // servidor lo dice: no inventa destinos.
+        assert!(!rooms.send_to("ABC123", 9, Message::text("nadie")));
     }
 
     #[test]

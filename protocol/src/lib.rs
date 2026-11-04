@@ -23,7 +23,7 @@ use serde_json::Value;
 ///
 /// Se incrementa cuando cambia la forma de los mensajes. Los dos lados
 /// tienen que hablar la misma.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Alfabeto de los códigos de sala.
 ///
@@ -61,17 +61,26 @@ pub enum ClientMessage {
         room: String,
     },
     /// Oferta SDP, en el JSON estandar de los navegadores.
+    ///
+    /// Va dirigida a un equipo: con varios controladores en la sala, la
+    /// oferta de uno no le sirve a otro.
     Offer {
+        /// Identificador del equipo al que va.
+        to: u64,
         /// `{"type":"offer","sdp":"v=0..."}`.
         sdp: Value,
     },
     /// Respuesta SDP, en el JSON estandar de los navegadores.
     Answer {
+        /// Identificador del equipo al que va.
+        to: u64,
         /// `{"type":"answer","sdp":"v=0..."}`.
         sdp: Value,
     },
     /// Candidato ICE, en el JSON estandar de los navegadores.
     Ice {
+        /// Identificador del equipo al que va.
+        to: u64,
         /// `{"candidate":"candidate:...","sdpMid":null,...}`.
         candidate: Value,
     },
@@ -133,8 +142,8 @@ pub enum ServerMessage {
 
 /// Un mensaje con la versión del protocolo.
 ///
-/// El cuerpo va *plano*: el JSON final es `{"version":1,"type":"offer",...}`
-/// y no `{"version":1,"body":{"type":"offer",...}}`.
+/// El cuerpo va *plano*: el JSON final es `{"version":2,"type":"offer",...}`
+/// y no `{"version":2,"body":{"type":"offer",...}}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Frame<T> {
     /// Versión del protocolo.
@@ -165,12 +174,13 @@ mod tests {
         });
         let json = serde_json::to_string(&frame).unwrap();
 
-        assert_eq!(json, r#"{"version":1,"type":"join","room":"ABC234"}"#);
+        assert_eq!(json, r#"{"version":2,"type":"join","room":"ABC234"}"#);
     }
 
     #[test]
     fn the_client_message_round_trips() {
         let frame = Frame::new(ClientMessage::Ice {
+            to: 3,
             candidate: serde_json::json!({
                 "candidate": "candidate:1 1 udp 2130706431 192.168.1.5 5000 typ host",
                 "sdpMid": null,
@@ -195,7 +205,7 @@ mod tests {
 
         assert_eq!(
             json,
-            r#"{"version":1,"type":"joined","room":"ABC234","id":7,"peers":[3,5]}"#
+            r#"{"version":2,"type":"joined","room":"ABC234","id":7,"peers":[3,5]}"#
         );
 
         let back: Frame<ServerMessage> = serde_json::from_str(&json).unwrap();
@@ -207,6 +217,7 @@ mod tests {
         // El servidor reenvía el mensaje del otro cliente sin tocarlo: el
         // cliente lo vuelve a leer como ClientMessage.
         let inner = Frame::new(ClientMessage::Offer {
+            to: 2,
             sdp: serde_json::json!({"type": "offer", "sdp": "v=0\r\n"}),
         });
         let relayed = Frame::new(ServerMessage::Relay {
@@ -222,9 +233,10 @@ mod tests {
         assert_eq!(peer, 2);
 
         let inner: Frame<ClientMessage> = serde_json::from_value(message).unwrap();
-        let ClientMessage::Offer { sdp } = inner.body else {
+        let ClientMessage::Offer { to, sdp } = inner.body else {
             panic!("no era una oferta");
         };
+        assert_eq!(to, 2);
         assert_eq!(sdp["type"], "offer");
     }
 
@@ -241,7 +253,7 @@ mod tests {
 
     #[test]
     fn a_missing_type_is_rejected() {
-        let json = r#"{"version":1,"room":"ABC123"}"#;
+        let json = r#"{"version":2,"room":"ABC123"}"#;
         let frame: Result<Frame<ClientMessage>, _> = serde_json::from_str(json);
 
         assert!(frame.is_err());

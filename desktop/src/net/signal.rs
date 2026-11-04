@@ -349,52 +349,34 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
         ServerMessage::Joined { room, id, peers } => {
             session.our_id = Some(id);
             session.room = Some(room.clone());
-            // El primero de la sala es el controlado; los que llegan
-            // después controlan al de menor identificador.
+            // El primero de la sala es el controlado. El que llega después
+            // es controlador, y espera que el controlado le ofrezca: no
+            // hay que mirar quién tiene el identificador más chico.
             session.controlado = peers.is_empty();
-            session.controlled = peers.iter().min().copied();
 
-            // El hilo de par ya puede preparar la sesión.
-            net::send_peer(peer_tx, PeerCommand::Start { id });
             net::publish_notice(sink, format!("en la sala {room}"));
 
             // El servidor validó el código: ya se puede entrar.
             eprintln!("[net] el servidor validó el código: sala {room} (id {id})");
 
-            // Los que ya estaban. El de identificador menor es el que
-            // ofrece, así que si el suyo es mayor que el nuestro, nos
-            // toca ofrecer.
-            for peer in &peers {
-                if id < *peer {
-                    eprintln!("[net] hay {peer} en la sala: le ofrezco la conexión");
-                    net::send_peer(peer_tx, PeerCommand::MakeOffer);
-                }
-            }
-
             if session.controlado {
                 eprintln!("[net] esperando a que otro equipo entre en la sala {room}");
                 net::publish_role(sink, Role::Controlado);
             } else {
+                eprintln!("[net] en la sala ya estaban: {peers:?}");
                 net::publish_role(sink, Role::Controlador);
+                net::publish_notice(sink, "esperando la oferta del controlado");
             }
         }
         ServerMessage::PeerJoined { peer } => {
-            let Some(id) = session.our_id else {
-                return;
-            };
-
             eprintln!("[net] entró otro equipo (id {peer}) en la sala");
+            net::publish_notice(sink, "llegó el otro equipo a la sala");
 
-            // Que haya sesión: si el otro equipo se había ido, esta vez
-            // se abre de cero.
-            net::send_peer(peer_tx, PeerCommand::Start { id });
-
-            if id < peer {
+            // Solo el controlado ofrece: cada controlador abre su canal
+            // con él, y dos controladores nunca se conectan entre sí.
+            if session.controlado {
                 eprintln!("[net] le ofrezco la conexión");
-                net::send_peer(peer_tx, PeerCommand::MakeOffer);
-            } else {
-                eprintln!("[net] espero que ofrezca");
-                net::publish_notice(sink, "llegó el otro equipo a la sala");
+                net::send_peer(peer_tx, PeerCommand::MakeOffer { peer });
             }
         }
         ServerMessage::PeerLeft { peer } => {
@@ -410,10 +392,9 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
                 return;
             }
 
-            // Se cae la sesión: si el otro equipo vuelve, se empareja de
-            // nuevo.
-            net::send_peer(peer_tx, PeerCommand::Stop);
-            net::publish_state(sink, NetState::Conectando);
+            // Se cae solo el par de ese equipo: los demás siguen como
+            // estaban. Si vuelve, se empareja de nuevo.
+            net::send_peer(peer_tx, PeerCommand::Close { peer });
             net::publish_notice(sink, "el otro equipo se fue de la sala");
         }
         ServerMessage::Relay { peer, message } => {
@@ -446,17 +427,32 @@ fn handle_relay(
     };
 
     match message {
-        ClientMessage::Offer { sdp } => {
+        ClientMessage::Offer { to, sdp } => {
+            if Some(to) != session.our_id {
+                return;
+            }
+
             eprintln!("[net] llegó una oferta");
-            net::send_peer(peer_tx, PeerCommand::AcceptOffer(sdp));
+            // El que ofrece es el controlado de la sala: es a él a quien
+            // se controla.
+            session.controlled = Some(peer);
+            net::send_peer(peer_tx, PeerCommand::AcceptOffer { peer, sdp });
         }
-        ClientMessage::Answer { sdp } => {
+        ClientMessage::Answer { to, sdp } => {
+            if Some(to) != session.our_id {
+                return;
+            }
+
             eprintln!("[net] llegó la respuesta");
-            net::send_peer(peer_tx, PeerCommand::AcceptAnswer(sdp));
+            net::send_peer(peer_tx, PeerCommand::AcceptAnswer { peer, sdp });
         }
-        ClientMessage::Ice { candidate } => {
+        ClientMessage::Ice { to, candidate } => {
+            if Some(to) != session.our_id {
+                return;
+            }
+
             eprintln!("[net] llegó un candidato ICE");
-            net::send_peer(peer_tx, PeerCommand::AddIce(candidate));
+            net::send_peer(peer_tx, PeerCommand::AddIce { peer, candidate });
         }
         // El controlado avisa a qué sala se fue. Solo vale si viene del
         // controlado de esta sala: el resto se ignora.
@@ -490,9 +486,9 @@ fn send_out(session: &mut Session, out: PeerOut) {
     };
 
     let body = match out {
-        PeerOut::Offer(sdp) => ClientMessage::Offer { sdp },
-        PeerOut::Answer(sdp) => ClientMessage::Answer { sdp },
-        PeerOut::Ice(candidate) => ClientMessage::Ice { candidate },
+        PeerOut::Offer { to, sdp } => ClientMessage::Offer { to, sdp },
+        PeerOut::Answer { to, sdp } => ClientMessage::Answer { to, sdp },
+        PeerOut::Ice { to, candidate } => ClientMessage::Ice { to, candidate },
     };
 
     send_frame(socket, &Frame::new(body));

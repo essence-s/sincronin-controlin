@@ -9,7 +9,7 @@ use crate::domain::interpolation::RemotePosition;
 use crate::domain::media::{Command, PlaybackState, Snapshot};
 
 /// Estado remoto parseado, para pintar en la UI del controlador.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemoteState {
     pub has_session: bool,
     pub playback: PlaybackState,

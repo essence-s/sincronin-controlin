@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use mpris::{Metadata, PlaybackStatus, Progress};
 
-use crate::media::PlaybackState;
+use crate::domain::media::PlaybackState;
 
 /// Tolerancia para decidir que una lectura de `Position` es un salto real.
 ///

@@ -1,10 +1,12 @@
-//! Adaptador de red: implementa [`crate::ports::NetPort`] sobre el módulo
-//! [`crate::net`] (señalización WebSocket + par str0m).
+//! Adaptador de red: implementa [`crate::ports::NetPort`] sobre el backend
+//! de [`backend`] (señalización WebSocket + par str0m).
 //!
-//! Traduce los eventos de `crate::net::Event` a `crate::domain::net::NetEvent`
-//! y expone el puerto que consumen los servicios de aplicación.
+//! Traduce los eventos de `backend::Event` a `crate::domain::net::NetEvent` y
+//! expone el puerto que consumen los servicios de aplicación.
 
-use std::sync::Arc;
+mod backend;
+
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
@@ -12,12 +14,24 @@ use crate::domain::net::NetEvent;
 use crate::domain::room::Role as DomainRole;
 use crate::ports::NetPort;
 
-use crate::net::{self, Command, Event as NetRawEvent, NetState as RawNetState, Role as RawRole};
+use self::backend as net;
+use self::backend::{Command, Event as NetRawEvent, NetState as RawNetState, Role as RawRole};
+
+/// Suscriptor y estado del hilo puente.
+///
+/// El puerto tiene un solo suscriptor: si se registra otro, reemplaza al
+/// anterior en vez de repartir los eventos entre dos hilos.
+#[derive(Default)]
+struct Subscriber {
+    callback: Option<Arc<dyn Fn(NetEvent) + Send + Sync>>,
+    bridge_started: bool,
+}
 
 /// Estado interno compartido para permitir clonar el adaptador.
 struct Inner {
     cmd_tx: Sender<Command>,
     rx: Receiver<NetRawEvent>,
+    subscriber: Arc<Mutex<Subscriber>>,
 }
 
 /// Adaptador de red.
@@ -43,6 +57,7 @@ impl NetAdapter {
             inner: Arc::new(Inner {
                 cmd_tx,
                 rx: sink_rx,
+                subscriber: Arc::new(Mutex::new(Subscriber::default())),
             }),
         }
     }
@@ -67,14 +82,36 @@ impl NetPort for NetAdapter {
     }
 
     fn on_event(&self, callback: Box<dyn Fn(NetEvent) + Send + Sync>) {
-        let callback = Arc::new(callback);
+        let callback: Arc<dyn Fn(NetEvent) + Send + Sync> = Arc::from(callback);
+        let mut subscriber = self
+            .inner
+            .subscriber
+            .lock()
+            .expect("el suscriptor de red no está poisoned");
+        subscriber.callback = Some(callback);
+
+        if subscriber.bridge_started {
+            return;
+        }
+        subscriber.bridge_started = true;
+        drop(subscriber);
+
         let rx = self.inner.rx.clone();
+        let subscriber = Arc::clone(&self.inner.subscriber);
 
         std::thread::Builder::new()
             .name("net-adapter".to_string())
             .spawn(move || {
                 while let Ok(event) = rx.recv() {
-                    callback(translate(event));
+                    let callback = subscriber
+                        .lock()
+                        .expect("el suscriptor de red no está poisoned")
+                        .callback
+                        .clone();
+
+                    if let Some(callback) = callback {
+                        callback(translate(event));
+                    }
                 }
             })
             .expect("no se pudo crear el hilo puente de red");

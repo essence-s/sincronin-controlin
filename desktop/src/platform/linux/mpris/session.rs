@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use mpris::{PlaybackStatus, Player, PlayerFinder};
 
-use crate::media::Session;
+use crate::domain::media::Session;
 
 /// Los nombres de bus de los proxies conocidos.
 ///

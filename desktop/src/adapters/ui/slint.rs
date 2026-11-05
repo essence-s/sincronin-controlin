@@ -4,19 +4,25 @@
 //! el bucle de eventos de Slint: los servicios las llaman desde el hilo de
 //! medios o el de red, y Slint no es thread-safe.
 //!
-//! El cableado de los callbacks vive en [`crate::app`]; este adaptador solo
-//! pinta el estado que le piden los servicios.
+//! También es el adaptador de entrada: traduce los callbacks de Slint a
+//! [`AppPort`], para que `app` solo componga las piezas.
+
+use std::sync::Arc;
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::domain::media::{PlaybackState, Snapshot};
 use crate::domain::messages::RemoteState;
 use crate::domain::room::Role;
-use crate::ports::UiPort;
+use crate::platform;
+use crate::ports::{AppPort, UiPort};
 use crate::{AppWindow, MediaSession};
 
 /// Cuántas líneas guarda el registro de la ventana de red.
 const MAX_LOG_LINES: usize = 40;
+
+/// El mensaje que manda el botón de prueba del panel.
+const TEST_MESSAGE: &str = "hola";
 
 /// Adaptador de UI.
 pub struct SlintAdapter {
@@ -35,6 +41,79 @@ impl SlintAdapter {
         F: FnOnce(&AppWindow) + Send + 'static,
     {
         let _ = self.ui.upgrade_in_event_loop(move |ui| operation(&ui));
+    }
+
+    /// Cablea los callbacks de entrada de la ventana contra [`AppPort`].
+    ///
+    /// Se llama una sola vez, cuando la ventana ya existe y el controlador
+    /// está construido. La UI no conoce los servicios: solo este adaptador.
+    pub fn wire(ui: &AppWindow, app: Arc<dyn AppPort>) {
+        {
+            let app = Arc::clone(&app);
+            let weak = ui.as_weak();
+            ui.on_toggle_play_pause(move || {
+                let playing = weak.upgrade().map(|ui| ui.get_playing()).unwrap_or(false);
+                app.toggle_play_pause(playing);
+            });
+        }
+
+        {
+            let app = Arc::clone(&app);
+            ui.on_seek_backward(move || app.seek_backward());
+        }
+
+        {
+            let app = Arc::clone(&app);
+            ui.on_seek_forward(move || app.seek_forward());
+        }
+
+        {
+            let app = Arc::clone(&app);
+            ui.on_seek_to(move |seconds: f32| app.seek_to(seconds));
+        }
+
+        {
+            let app = Arc::clone(&app);
+            ui.on_select_session(move |id: SharedString| app.select_session(id.to_string()));
+        }
+
+        {
+            let app = Arc::clone(&app);
+            ui.on_connect(move |room: SharedString| app.connect(room.to_string()));
+        }
+
+        {
+            let app = Arc::clone(&app);
+            ui.on_disconnect(move || app.disconnect());
+        }
+
+        {
+            let app = Arc::clone(&app);
+            ui.on_send_message(move || app.send_message(TEST_MESSAGE.to_string()));
+        }
+
+        {
+            let app = Arc::clone(&app);
+            let weak = ui.as_weak();
+            ui.on_net_toggled(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+
+                platform::configure(&ui);
+                app.panel_toggled(ui.get_net_open());
+            });
+        }
+
+        {
+            let weak = ui.as_weak();
+            ui.on_quit(move || {
+                if let Some(ui) = weak.upgrade() {
+                    let _ = ui.hide();
+                }
+                let _ = slint::quit_event_loop();
+            });
+        }
     }
 }
 
@@ -89,7 +168,7 @@ impl UiPort for SlintAdapter {
             }
 
             ui.set_net_open(true);
-            crate::platform::configure(ui);
+            platform::configure(ui);
         });
     }
 }

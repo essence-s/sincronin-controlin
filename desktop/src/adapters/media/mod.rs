@@ -1,5 +1,5 @@
-//! Adaptador de medios: implementa [`crate::ports::MediaPort`] sobre el módulo
-//! [`crate::media`] y su backend de plataforma (GSMTC, MPRIS, stub).
+//! Adaptador de medios: implementa [`crate::ports::MediaPort`] sobre el
+//! backend de plataforma (GSMTC, MPRIS, stub).
 //!
 //! Traduce los comandos de la aplicación al canal de comandos del backend y
 //! los snapshots del backend al callback del puerto.
@@ -15,8 +15,7 @@ use crossbeam_channel::{Sender, unbounded};
 use crate::domain::media::{Command, Snapshot};
 use crate::ports::MediaPort;
 
-use crate::media::Sink as MediaSink;
-use crate::platform;
+use crate::platform::{self, Sink as MediaSink};
 
 /// Callback del puerto y última foto publicada por el backend.
 #[derive(Default)]

@@ -14,7 +14,7 @@
 //!
 //! ## El reparto
 //!
-//! ```
+//! ```text
 //!   UI ──Command──▶ net-signal ──WebSocket──▶ VPS
 //!                     │   ▲
 //!                     │   └──PeerOut (oferta, respuesta, candidatos)
@@ -1093,7 +1093,7 @@ mod tests {
 
     /// Levanta el servidor STUN de pruebas en un puerto efimero.
     fn start_stun_server() -> String {
-        use crate::net::peer::{STUN_MAGIC, STUN_REQUEST_TYPE, binding_success_reply};
+        use super::peer::{STUN_MAGIC, STUN_REQUEST_TYPE, binding_success_reply};
 
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
 

@@ -20,7 +20,9 @@ use tungstenite::stream::MaybeTlsStream;
 
 use protocol::{ClientMessage, Frame, ServerMessage, VERSION};
 
-use crate::net::{self, Command, NetState, PeerCommand, PeerOut, Role, Sink};
+use crate::adapters::net::backend::{
+    self as net, Command, NetState, PeerCommand, PeerOut, Role, Sink,
+};
 
 /// Cuanto espera el socket a una lectura antes de volver al bucle.
 ///
@@ -688,7 +690,7 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    use crate::net::Event;
+    use crate::adapters::net::backend::Event;
 
     /// Un sink que anota los eventos, y el registro.
     fn recording_sink() -> (Sink, Arc<Mutex<Vec<Event>>>) {

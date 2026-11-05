@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use mpris::{Metadata, Player, Progress};
 
-use crate::media::{Command, Session, Snapshot};
+use crate::domain::media::{Command, Session, Snapshot};
 
 use super::timeline::Timeline;
 

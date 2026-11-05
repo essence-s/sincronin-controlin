@@ -6,10 +6,20 @@
 //! `if platform ==` en runtime que se pueda invertir por error.
 //!
 //! - **Windows** → backend real sobre GSMTC (`Windows.Media.Control`) más los
-//!   estilos de ventana de [`windows::window`].
-//! - **Linux** → backend real sobre MPRIS (D-Bus) más [`linux::window`].
-//! - **Otros** → [`stub`], un shim para iterar la UI sin backend real. No es
+//!   estilos de ventana de `windows::window`.
+//! - **Linux** → backend real sobre MPRIS (D-Bus) más `linux::window`.
+//! - **Otros** → `stub`, un shim para iterar la UI sin backend real. No es
 //!   una implementación de macOS: solo permite compilar y ver la interfaz.
+
+use std::sync::Arc;
+
+use crate::domain::media::Snapshot;
+
+/// Callback con el que un backend de plataforma publica cada cambio.
+///
+/// Los backends viven detrás de `#[cfg]`; el tipo queda acá para que el
+/// adaptador de medios no dependa de una plataforma concreta.
+pub type Sink = Arc<dyn Fn(Snapshot) + Send + Sync + 'static>;
 
 #[cfg(windows)]
 mod windows;

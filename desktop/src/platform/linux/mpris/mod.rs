@@ -50,7 +50,8 @@ use std::time::Instant;
 use crossbeam_channel::Receiver;
 use mpris::Player;
 
-use crate::media::{Command, Sink, Snapshot};
+use crate::domain::media::{Command, Snapshot};
+use crate::platform::Sink;
 
 use self::session::Catalog;
 use self::signals::Signal;

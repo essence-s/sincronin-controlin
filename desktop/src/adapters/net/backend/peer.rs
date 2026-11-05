@@ -56,7 +56,7 @@ use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 
-use crate::net::{self, NetState, PeerCommand, PeerOut, Sink};
+use crate::adapters::net::backend::{self as net, NetState, PeerCommand, PeerOut, Sink};
 
 /// Etiqueta del canal de datos.
 const CHANNEL_LABEL: &str = "control";

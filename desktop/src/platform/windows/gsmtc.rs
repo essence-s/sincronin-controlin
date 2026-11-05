@@ -11,7 +11,8 @@
 //! - Los manejadores de eventos de `WinRT` solo envían un aviso por canal; el
 //!   trabajo (leer metadatos, pedir acciones) ocurre siempre en el hilo "gsmtc".
 
-use crate::media::{Command, PlaybackState, Session, Sink, Snapshot};
+use crate::domain::media::{Command, PlaybackState, Session, Snapshot};
+use crate::platform::Sink;
 
 use super::aumid::Names;
 

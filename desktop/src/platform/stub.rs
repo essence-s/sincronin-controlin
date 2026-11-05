@@ -1,16 +1,16 @@
-//! Shim de desarrollo. **No es una implementación de Linux.**
+//! Shim de desarrollo. **No es una implementación real de ninguna plataforma.**
 //!
-//! No existe GSMTC fuera de Windows, así que simulamos una sesión para poder
-//! iterar el diseño de la barra desde Linux. En Windows se compila
-//! [`super::windows`] en su lugar.
+//! Simula una sesión para poder iterar el diseño de la barra donde no hay
+//! backend. En Windows se compila `super::windows`; en Linux, `super::linux`.
 //!
-//! Cuando exista una implementación real para Linux (MPRIS sobre D-Bus, por
-//! ejemplo), este archivo se reemplaza por ella y deja de hacer falta.
+//! Cuando exista una implementación real para esta plataforma, este archivo
+//! se reemplaza por ella y deja de hacer falta.
 
 use crossbeam_channel::Receiver;
 
 use crate::AppWindow;
-use crate::media::{Command, PlaybackState, Sink, Snapshot};
+use crate::domain::media::{Command, PlaybackState, Snapshot};
+use crate::platform::Sink;
 
 const TICKS_PER_SEC: i64 = 10_000_000;
 const TOTAL_SECS: i64 = 215;
@@ -25,8 +25,8 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
             let publish = |playing: bool, position: i64| {
                 sink(Snapshot {
                     has_session: true,
-                    title: "Backend de prueba (sin GSMTC)".to_string(),
-                    artist: "solo en Linux · en Windows manda el sistema".to_string(),
+                    title: "Backend de prueba (sin backend real)".to_string(),
+                    artist: "shim de desarrollo".to_string(),
                     album: String::new(),
                     source_app: "stub".to_string(),
                     state: if playing {
@@ -49,12 +49,20 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
 
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
-                    Command::TogglePlayPause => playing = !playing,
+                    Command::Play => playing = true,
+                    Command::Pause => playing = false,
+                    Command::Stop => {
+                        playing = false;
+                        position = 0;
+                    }
                     Command::SeekBackward => {
                         position = (position - 10 * TICKS_PER_SEC).max(0);
                     }
                     Command::SeekForward => {
                         position = (position + 10 * TICKS_PER_SEC).min(TOTAL_SECS * TICKS_PER_SEC);
+                    }
+                    Command::SeekTo(ticks) => {
+                        position = ticks.clamp(0, TOTAL_SECS * TICKS_PER_SEC);
                     }
                     // El shim solo tiene una sesión: no hay a qué cambiar.
                     Command::SelectSession(_) => {}
@@ -65,7 +73,7 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
         .expect("no se pudo crear el hilo de prueba");
 }
 
-/// No-op: en Linux no hay estilos de ventana que ajustar.
+/// No-op: esta plataforma no tiene estilos de ventana que ajustar.
 ///
 /// Existe para que [`crate::app`] pueda llamar a `configure` sin saber en qué
 /// plataforma está — el despacho vive en [`super`].

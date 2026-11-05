@@ -1,7 +1,8 @@
 //! Tipos de medios del dominio.
 //!
-//! Extraído de [`crate::media`]. Es el contrato agnóstico de plataforma
-//! para comandos y snapshots de reproducción.
+//! Es el contrato agnóstico de plataforma para comandos y snapshots de
+//! reproducción. Los backends de `platform` y el adaptador de medios los
+//! comparten sin depender entre sí.
 
 /// Orden que envía la UI al backend de medios.
 #[derive(Clone, Debug, PartialEq)]

@@ -83,6 +83,13 @@ impl<M: MediaPort, N: NetPort + Clone> AppPort for AppController<M, N> {
 
     fn disconnect(&self) {
         self.pairing.disconnect();
+
+        // Al salir se vuelve a la sala propia: la vista de unión queda con un
+        // código vivo, que es el que se puede volver a compartir. Es el mismo
+        // camino que abrir el panel.
+        let code = self.pairing.local_room_code();
+        self.ui.set_room_code(code);
+        self.pairing.connect(None);
     }
 
     fn panel_toggled(&self, open: bool) {
@@ -194,6 +201,8 @@ mod tests {
         fn set_peer_room(&self, _room: String) {}
 
         fn set_can_send(&self, _can: bool) {}
+
+        fn set_peer_count(&self, _count: usize) {}
 
         fn append_log(&self, _line: String) {}
 
@@ -320,6 +329,38 @@ mod tests {
                 .expect("las conexiones no están poisoned")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn disconnect_reenters_the_local_room() {
+        let harness = harness();
+
+        harness.controller.disconnect();
+
+        assert_eq!(
+            *harness
+                .net
+                .disconnects
+                .lock()
+                .expect("las desconexiones no están poisoned"),
+            1
+        );
+        assert_eq!(
+            *harness
+                .net
+                .connects
+                .lock()
+                .expect("las conexiones no están poisoned"),
+            vec![None]
+        );
+        assert_eq!(
+            *harness
+                .ui
+                .room_codes
+                .lock()
+                .expect("los códigos no están poisoned"),
+            vec!["TEST01"]
         );
     }
 

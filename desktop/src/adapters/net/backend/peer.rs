@@ -150,6 +150,9 @@ pub(crate) fn run(
 ) -> Result<(), RtcError> {
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut buf: Vec<u8> = Vec::new();
+    // El último conteo publicado. Arranca en 0 para no avisar nada al
+    // empezar.
+    let mut peers_published = 0usize;
 
     loop {
         // 1) Los comandos que ya están esperando.
@@ -160,6 +163,7 @@ pub(crate) fn run(
         }
 
         // 2) Sin pares no hay nada que hacer: esperar un comando.
+        sync_peer_count(&sessions, &mut peers_published, &sink);
         if sessions.is_empty() {
             match cmd_rx.recv_timeout(IDLE_WAIT) {
                 Ok(cmd) => {
@@ -194,6 +198,9 @@ pub(crate) fn run(
         for peer in broken {
             sessions.remove(&peer);
         }
+        // Un canal que se abrió (o se cerró) en este `pump` cambia el
+        // conteo: se publica acá, cuando ya terminó de drenar str0m.
+        sync_peer_count(&sessions, &mut peers_published, &sink);
         if sessions.is_empty() {
             continue;
         }
@@ -224,6 +231,21 @@ pub(crate) fn run(
     }
 
     Ok(())
+}
+
+/// Publica cuántos equipos tienen el canal de datos abierto, si cambió.
+///
+/// Solo cuenta los pares con el canal abierto: uno que quedó en ICE no está
+/// en la sala desde el punto de vista del usuario. Se publica desde el bucle
+/// y no desde `handle_event` para no meter un evento en medio de los que
+/// produce str0m.
+fn sync_peer_count(sessions: &HashMap<u64, Session>, published: &mut usize, sink: &Sink) {
+    let count = sessions.values().filter(|s| s.channel.is_some()).count();
+
+    if count != *published {
+        *published = count;
+        net::publish_peer_count(sink, count);
+    }
 }
 
 /// Drena la salida de str0m y devuelve cuándo hay que despertarlo.
@@ -871,6 +893,14 @@ fn handle_event(event: Event, current: &mut Session, sink: &Sink) {
             eprintln!("[net] canal de datos abierto: {label}");
             net::publish_state(sink, NetState::Conectado);
             net::publish_notice(sink, format!("canal de datos abierto: {label}"));
+        }
+        // Se cerró el canal: el equipo ya no cuenta como conectado. Solo se
+        // limpia si es el canal actual, porque el cierre de uno viejo puede
+        // llegar después de que ya se abrió el nuevo.
+        Event::ChannelClose(id) => {
+            if current.channel == Some(id) {
+                current.channel = None;
+            }
         }
         Event::ChannelData(data) => {
             if data.binary {

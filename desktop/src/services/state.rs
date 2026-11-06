@@ -65,6 +65,7 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
         match event {
             NetEvent::State(state) => self.on_net_state(state, now),
             NetEvent::AssignedRole(role) => self.on_role(role, now),
+            NetEvent::PeerCount(count) => self.ui.set_peer_count(count),
             NetEvent::Notice(text) => self.ui.append_log(format!("· {text}")),
             NetEvent::Message(text) => self.on_message(text, now),
             NetEvent::ControlledMoved { room } => {
@@ -151,6 +152,8 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
         } else {
             self.publisher = StatePublisher::new();
             self.pending = None;
+            // Sin conexión no hay equipos: la vista vuelve a la de unión.
+            self.ui.set_peer_count(0);
 
             // Si se cierra el canal, el estado remoto deja de ser válido:
             // se vuelve a la reproducción local.
@@ -364,6 +367,7 @@ mod tests {
         room_codes: Mutex<Vec<String>>,
         peer_rooms: Mutex<Vec<String>>,
         can_send: Mutex<Vec<bool>>,
+        peer_counts: Mutex<Vec<usize>>,
         log: Mutex<Vec<String>>,
         open_panel: Mutex<usize>,
     }
@@ -416,6 +420,13 @@ mod tests {
                 .lock()
                 .expect("la UI no está poisoned")
                 .push(can);
+        }
+
+        fn set_peer_count(&self, count: usize) {
+            self.peer_counts
+                .lock()
+                .expect("la UI no está poisoned")
+                .push(count);
         }
 
         fn append_log(&self, line: String) {
@@ -725,6 +736,46 @@ mod tests {
         let (state, _) = shown.first().expect("se pintó el estado remoto");
         assert!(state.can_toggle);
         assert!(!state.can_seek);
+    }
+
+    #[test]
+    fn peer_count_rises_when_a_channel_opens() {
+        let mut h = harness();
+        let now = Instant::now();
+
+        h.service
+            .on_net_event(NetEvent::State(NetState::Conectado), now);
+        h.service.on_net_event(NetEvent::PeerCount(1), now);
+
+        assert_eq!(
+            h.ui.peer_counts
+                .lock()
+                .expect("la UI no está poisoned")
+                .last()
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn peer_count_resets_when_the_connection_drops() {
+        let mut h = harness();
+        let now = Instant::now();
+
+        h.service
+            .on_net_event(NetEvent::State(NetState::Conectado), now);
+        h.service.on_net_event(NetEvent::PeerCount(1), now);
+        h.service
+            .on_net_event(NetEvent::State(NetState::Desconectado), now);
+
+        assert_eq!(
+            h.ui.peer_counts
+                .lock()
+                .expect("la UI no está poisoned")
+                .last()
+                .copied(),
+            Some(0)
+        );
     }
 
     #[test]

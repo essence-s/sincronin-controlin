@@ -265,6 +265,9 @@ export component AppWindow inherits Window {
     in property <string> role-text: "";
     // Si el canal de datos está abierto, se puede mandar.
     in property <bool> can-send: false;
+    // Cuántos equipos tienen el canal de datos abierto. Cero es la vista de
+    // unión, que espera a que alguien entre; uno o más, la vista conectada.
+    in property <int> peer-count: 0;
     // Los avisos y mensajes que publica la red. Ningún panel los muestra
     // todavía: se guardan para cuando haya un lugar donde leerlos.
     in property <string> log-text: "";
@@ -400,15 +403,14 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // ── Conexión ──
+                // ── Conexión: vista de unión ──
+                //
+                // Mientras no hay equipos conectados. El contenido mide
+                // 112×112 px (155 menos los 42 del menú y el 1 del separador),
+                // así que el código, la "o" y el campo del otro equipo van en
+                // tres filas apretadas.
                 PanelSlot {
-                    active: root.active-panel == 1;
-
-                    // El contenido mide 112×112 px (155 menos los 42 del
-                    // menú y el 1 del separador), así que el código, la "o" y
-                    // el campo del otro equipo van en tres filas apretadas:
-                    // no entra una tarjeta con estado ni el botón de
-                    // desconectar (vuelven con la vista conectada).
+                    active: root.active-panel == 1 && root.peer-count == 0;
                     VerticalLayout {
                         padding-left: 8px;
                         padding-right: 8px;
@@ -486,6 +488,104 @@ export component AppWindow inherits Window {
                                 height: 26px;
                                 primary: true;
                                 clicked => { root.connect(root.peer-room); }
+                            }
+                        }
+                    }
+                }
+
+                // ── Conexión: vista conectada ──
+                //
+                // Con al menos un equipo en el canal: la misma fila de la
+                // sala, el rol en una línea y las órbitas, una por equipo.
+                // El botón de desconectar va al costado de las órbitas: en la
+                // fila del código no entra.
+                PanelSlot {
+                    active: root.active-panel == 1 && root.peer-count > 0;
+
+                    VerticalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 4px;
+                        alignment: center;
+
+                        HorizontalLayout {
+                            spacing: 4px;
+                            cross-axis-alignment: center;
+
+                            copy_source := CodeField {
+                                horizontal-stretch: 1;
+                                height: 24px;
+                                text: root.room-code;
+                                read-only: true;
+                                bare: true;
+                                font-size: 13px;
+                                font-weight: 500;
+                                letter-spacing: 0.5px;
+                            }
+
+                            IconButton {
+                                icon: @image-url("../assets/icons/content_copy.svg");
+                                icon-size: 13px;
+                                width: 22px;
+                                height: 22px;
+                                flat: true;
+                                clicked => { copy_source.copy-text(); }
+                            }
+                        }
+
+                        // Quién sos en la sala. La vista ya dice que la
+                        // conexión está abierta, así que solo va el rol.
+                        Text {
+                            text: root.role-text;
+                            color: #8d8d99;
+                            font-size: 9px;
+                            horizontal-alignment: center;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 4px;
+                            cross-axis-alignment: center;
+
+                            // Un círculo por equipo. `animation-tick` es el
+                            // reloj de animación de Slint, no un timer que
+                            // consulte nada: la órbita gira con el cuadro.
+                            orbit := Rectangle {
+                                width: 48px;
+                                height: 48px;
+                                property <length> radius: 16px;
+                                property <angle> spin: 1turn * (animation-tick() / 1s);
+
+                                for i in root.peer-count: Rectangle {
+                                    property <angle> phase: orbit.spin + 1turn * (i * 1.0 / root.peer-count);
+                                    width: 14px;
+                                    height: 14px;
+                                    border-radius: 7px;
+                                    background: #7c7cff22;
+                                    x: (parent.width - self.width) / 2 + orbit.radius * Math.cos(phase);
+                                    y: (parent.height - self.height) / 2 + orbit.radius * Math.sin(phase);
+                                    opacity: 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(phase));
+
+                                    Rectangle {
+                                        width: 6px;
+                                        height: 6px;
+                                        border-radius: 3px;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        background: #a9a9ff;
+                                    }
+                                }
+                            }
+
+                            IconButton {
+                                icon: @image-url("../assets/icons/logout.svg");
+                                icon-size: 13px;
+                                width: 24px;
+                                height: 24px;
+                                flat: true;
+                                clicked => { root.disconnect(); }
                             }
                         }
                     }

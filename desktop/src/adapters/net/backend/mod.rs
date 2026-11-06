@@ -107,6 +107,8 @@ pub enum Event {
     Notice(String),
     /// El rol asignado en la sala: controlado o controlador.
     AssignedRole(Role),
+    /// Cuántos equipos tienen el canal de datos abierto con este.
+    PeerCount(usize),
     /// El controlado se fue a otra sala, avisando a dónde.
     ControlledMoved {
         /// La sala en la que está ahora.
@@ -336,6 +338,11 @@ pub(crate) fn publish_role(sink: &Sink, role: Role) {
     sink(Event::AssignedRole(role));
 }
 
+/// Publica cuántos equipos tienen el canal de datos abierto.
+pub(crate) fn publish_peer_count(sink: &Sink, count: usize) {
+    sink(Event::PeerCount(count));
+}
+
 /// Publica que el controlado se fue a otra sala.
 pub(crate) fn publish_controlled_moved(sink: &Sink, room: String) {
     sink(Event::ControlledMoved { room });
@@ -395,6 +402,9 @@ mod tests {
     /// Las salas de las pruebas de varios controladores: cada test usa las
     /// suyas.
     const TWO_CONTROLLERS_ROOM: &str = "B4D6FH";
+
+    /// La sala de la prueba del conteo de canales.
+    const PEER_COUNT_ROOM: &str = "N4P6QR";
     const THREE_ROOM_A: &str = "D7F9HJ";
     const THREE_ROOM_OTHER: &str = "E2G4KM";
     const THREE_FOLLOW_FROM_ROOM: &str = "F8H2KN";
@@ -1241,6 +1251,51 @@ mod tests {
             let opened = channels_opened(&events.lock().expect("el registro no está poisoned"));
             assert_eq!(opened, 1, "{name} tenía que tener un solo canal");
         }
+    }
+
+    /// El conteo sigue a los canales de datos: uno cuando el otro equipo
+    /// abre el suyo y cero cuando se va.
+    #[test]
+    fn the_backend_publishes_the_peer_count_of_open_channels() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+
+        cmd_a
+            .send(Command::Connect {
+                room: PEER_COUNT_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+
+        cmd_b
+            .send(Command::Connect {
+                room: PEER_COUNT_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, channel_opened);
+        wait_for(&events_b, channel_opened);
+
+        // Los dos ven un solo equipo conectado: el otro.
+        for events in [&events_a, &events_b] {
+            wait_for(events, |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::PeerCount(1)))
+            });
+        }
+
+        // Y cuando el otro se va, el que se queda vuelve a cero.
+        cmd_b
+            .send(Command::Disconnect)
+            .expect("el canal de comandos está abierto");
+
+        wait_for(&events_a, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::PeerCount(0)))
+        });
     }
 
     /// Si un controlador se va a otra sala, el que se queda no pierde el

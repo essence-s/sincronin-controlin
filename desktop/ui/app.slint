@@ -42,7 +42,7 @@ component CodeField inherits Rectangle {
 
     // El texto de ejemplo, mientras no hay nada escrito.
     if root.text == "" && root.placeholder != "": Text {
-        x: root.bare ? 0px : 10px;
+        x: root.bare ? 0px : 8px;
         text: root.placeholder;
         color: #6f6f7c;
         font-size: root.font-size;
@@ -50,8 +50,8 @@ component CodeField inherits Rectangle {
     }
 
     input := TextInput {
-        x: root.bare ? 0px : 10px;
-        width: root.bare ? parent.width : parent.width - 20px;
+        x: root.bare ? 0px : 8px;
+        width: root.bare ? parent.width : parent.width - 16px;
         height: parent.height;
         text <=> root.text;
         read-only: root.read-only;
@@ -88,6 +88,9 @@ component IconButton inherits Rectangle {
     // Sin fondo salvo al pasar el mouse: para acciones secundarias (copiar,
     // desconectar) que no deben competir con el resto.
     in property <bool> flat: false;
+    // La acción principal del panel: se pinta con el acento, para que
+    // compita con el resto de los botones.
+    in property <bool> primary: false;
     callback clicked();
 
     width: 34px;
@@ -95,6 +98,8 @@ component IconButton inherits Rectangle {
     border-radius: 9px;
     background: root.selected
         ? #7c7cff2e
+        : root.primary
+        ? (touch.pressed ? #7c7cff5c : (touch.has-hover ? #7c7cff4d : #7c7cff3a))
         : root.flat ? (touch.pressed ? #ffffff1f : (touch.has-hover ? #ffffff10 : transparent))
         : (touch.pressed ? #55555b : (touch.has-hover ? #2d2d2f : #353539));
     opacity: root.active ? 1 : 0.35;
@@ -116,44 +121,6 @@ component IconButton inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-}
-
-// Botón con texto, para las acciones que conviene leer (Conectar).
-//
-// El botón se ajusta al texto: el `Text` va directo (no en un layout) para
-// que su ancho sea el natural y no dependa del botón. Un `Rectangle` en un
-// layout no tiene ancho propio y se invisible.
-component ActionButton inherits Rectangle {
-    in property <string> label: "";
-    in property <bool> active: true;
-    // La acción principal del panel: se pinta con el acento.
-    in property <bool> primary: false;
-    callback clicked();
-
-    height: 30px;
-    border-radius: 8px;
-    background: root.primary
-        ? (touch.pressed ? #7c7cff4d : (touch.has-hover ? #7c7cff3d : #7c7cff2e))
-        : (touch.pressed ? #4d4d56 : (touch.has-hover ? #3a3a41 : #2c2c32));
-    opacity: root.active ? 1 : 0.4;
-
-    touch := TouchArea {
-        clicked => {
-            if root.active {
-                root.clicked();
-            }
-        }
-    }
-
-    txt := Text {
-        text: root.label;
-        color: root.primary ? #dcdcff : #ececf3;
-        font-size: 12px;
-        x: 12px;
-        y: (root.height - txt.height) / 2;
-    }
-
-    width: txt.width + 24px;
 }
 
 // Una sesión de medios que se puede elegir.
@@ -307,19 +274,6 @@ export component AppWindow inherits Window {
     // el inicio, sin ocupar el ancho de Controles.
     in-out property <int> active-panel: 1;
 
-    // La etiqueta de la tarjeta del código: con el canal abierto dice el rol
-    // ("CONECTADO · INVITADO"); si no, el estado que publica la red. La sala
-    // en la que se está se lee en el código de abajo.
-    pure function card-label() -> string {
-        if !root.can-send {
-            return root.state-text.to-uppercase();
-        }
-        if root.role-text == "" {
-            return "CONECTADO";
-        }
-        return "CONECTADO · " + root.role-text.to-uppercase();
-    }
-
     callback toggle-play-pause();
     callback seek-backward();
     callback seek-forward();
@@ -450,97 +404,88 @@ export component AppWindow inherits Window {
                 PanelSlot {
                     active: root.active-panel == 1;
 
+                    // El contenido mide 112×112 px (155 menos los 42 del
+                    // menú y el 1 del separador), así que el código, la "o" y
+                    // el campo del otro equipo van en tres filas apretadas:
+                    // no entra una tarjeta con estado ni el botón de
+                    // desconectar (vuelven con la vista conectada).
                     VerticalLayout {
-                        padding-left: 16px;
-                        padding-right: 14px;
-                        padding-top: 10px;
-                        padding-bottom: 10px;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
                         spacing: 8px;
                         alignment: center;
 
-                        // El código es la pieza protagonista: la etiqueta de
-                        // arriba dice en qué estado está la conexión, y el
-                        // botón de copiar vive adentro de la misma tarjeta.
-                        Rectangle {
-                            height: 44px;
-                            border-radius: 10px;
-                            background: @linear-gradient(140deg, #ffffff14, #ffffff06);
-                            border-width: 1px;
-                            border-color: root.can-send ? #6ee7a855 : #ffffff1a;
-                            clip: true;
+                        // El código propio con su punto de estado y el botón
+                        // de copiar al lado.
+                        HorizontalLayout {
+                            spacing: 4px;
+                            cross-axis-alignment: center;
 
-                            // Un punto: verde si el canal está abierto.
+                            // Un punto: verde si el canal está abierto. Sin
+                            // texto, es lo único que avisa que la conexión
+                            // prendió hasta que exista la vista conectada.
                             Rectangle {
-                                x: 12px;
-                                y: 12px;
-                                width: 5px;
-                                height: 5px;
+                                width: 6px;
+                                height: 6px;
                                 border-radius: 3px;
                                 background: root.can-send ? #6ee7a8 : #5c5c66;
                             }
 
-                            Text {
-                                x: 23px;
-                                y: 6px;
-                                width: parent.width - 62px;
-                                text: card-label();
-                                color: root.can-send ? #a9a9ff : #7d7d89;
-                                font-size: 9px;
-                                letter-spacing: 1.2px;
-                                overflow: elide;
-                            }
-
                             code := CodeField {
-                                x: 12px;
-                                y: 20px;
-                                width: parent.width - 56px;
-                                height: 20px;
+                                horizontal-stretch: 1;
+                                height: 30px;
                                 text: root.room-code;
                                 read-only: true;
                                 bare: true;
-                                font-size: 19px;
+                                font-size: 13px;
                                 font-weight: 500;
-                                letter-spacing: 1px;
+                                letter-spacing: 0.5px;
                             }
 
                             IconButton {
                                 icon: @image-url("../assets/icons/content_copy.svg");
-                                icon-size: 14px;
-                                width: 28px;
-                                height: 28px;
+                                icon-size: 13px;
+                                width: 22px;
+                                height: 22px;
                                 flat: true;
-                                x: parent.width - 38px;
-                                y: 8px;
                                 clicked => { code.copy-text(); }
                             }
+                        }
+
+                        // La "o" que une los dos códigos: el de la sala en la
+                        // que estoy y el de la sala a la que quiero entrar.
+                        Text {
+                            text: "o";
+                            horizontal-alignment: center;
+                            color: #6f6f7c;
+                            font-size: 10px;
                         }
 
                         // Unirse a otra sala: se escribe el código y se
                         // conecta, con el botón o con Enter.
                         HorizontalLayout {
-                            spacing: 8px;
+                            spacing: 5px;
                             cross-axis-alignment: center;
 
                             CodeField {
-                                text <=> root.peer-room;
-                                placeholder: "código del anfitrión";
                                 horizontal-stretch: 1;
+                                height: 26px;
+                                text <=> root.peer-room;
+                                placeholder: "código";
+                                font-size: 12px;
                                 accepted => { root.connect(root.peer-room); }
                             }
 
-                            ActionButton {
-                                label: "Conectar";
+                            IconButton {
+                                icon: @image-url("../assets/icons/link.svg");
+                                icon-size: 14px;
+                                tint: #dcdcff;
+                                width: 24px;
+                                height: 26px;
                                 primary: true;
                                 clicked => { root.connect(root.peer-room); }
-                            }
-
-                            IconButton {
-                                icon: @image-url("../assets/icons/logout.svg");
-                                icon-size: 14px;
-                                width: 24px;
-                                height: 24px;
-                                flat: true;
-                                clicked => { root.disconnect(); }
                             }
                         }
                     }

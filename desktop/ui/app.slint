@@ -188,7 +188,7 @@ export component AppWindow inherits Window {
     // Con el panel abierto la ventana es más alta. El compositor la ancla
     // abajo (la regla de Hyprland se re-aplica al redimensionar), asi que
     // crece hacia arriba y la barra no se mueve.
-    height: root.net-open ? 424px : 84px;
+    height: root.net-open ? 424px : 112px;
 
     // El alto que quiere la ventana. En Windows lo usa el backend para
     // anclar la ventana abajo: el tamaño nativo todavia no se actualizó
@@ -401,111 +401,116 @@ export component AppWindow inherits Window {
             // línea de progreso sea relativa a la barra y no a la ventana
             // (que crece).
             Rectangle {
-                height: 84px;
+                height: 112px;
 
-                // Contenido: texto flexible a la izquierda, botones con su
-                // tamaño a la derecha.
-                // `cross-axis-alignment: center` es lo que los centra
-                // verticalmente.
-                HorizontalLayout {
-                    x: 0;
-                    y: 0;
+                // Contenido: título y artista a la izquierda, botones a la
+                // derecha, en la fila de arriba. El slider va debajo, a lo
+                // ancho completo para que sea más largo.
+                VerticalLayout {
                     width: parent.width;
                     height: parent.height;
+                    alignment: center;
+                    spacing: 6px;
                     padding-left: 18px;
-                    padding-right: 14px;
-                    spacing: 12px;
-                    cross-axis-alignment: center;
+                    padding-right: 18px;
 
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        alignment: center;
-                        spacing: 1px;
+                    HorizontalLayout {
+                        // width: parent.width;
+                        // padding-left: 18px;
+                        // padding-right: 14px;
+                        spacing: 12px;
+                        cross-axis-alignment: center;
 
-                        Text {
-                            text: root.track-title;
-                            color: root.has-session ? #f4f4f8 : #8d8d99;
-                            font-size: 14px;
-                            overflow: elide;
-                        }
+                        VerticalLayout {
+                            width: 50%;
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            // spacing: 1px;
 
-                        Text {
-                            text: root.track-artist;
-                            color: #9a9aa6;
-                            font-size: 11px;
-                            overflow: elide;
-                        }
+                            Text {
+                                text: root.track-title;
+                                color: root.has-session ? #f4f4f8 : #8d8d99;
+                                font-size: 14px;
+                                overflow: elide;
+                            }
 
-                        // Selector de sesión: solo aparece cuando hay más de una.
-                        if root.session-count > 1: HorizontalLayout {
-                            horizontal-stretch: 0;
-                            spacing: 5px;
+                            Text {
+                                text: root.track-artist;
+                                color: #9a9aa6;
+                                font-size: 11px;
+                                overflow: elide;
+                            }
 
-                            for session in root.sessions: SessionChip {
-                                label: session.label;
-                                selected: session.id == root.session-id;
-                                clicked => { root.select-session(session.id); }
+                            // Selector de sesión: solo aparece cuando hay más de una.
+                            if root.session-count > 1: HorizontalLayout {
+                                horizontal-stretch: 0;
+                                spacing: 5px;
+                                padding-top: 5px;
+
+                                for session in root.sessions: SessionChip {
+                                    label: session.label;
+                                    selected: session.id == root.session-id;
+                                    clicked => { root.select-session(session.id); }
+                                }
                             }
                         }
 
-                        // Línea de progreso: un slider para buscar posición,
-                        // y un riel de referencia ligero debajo.
-                        Slider {
-                            // x: 18px;
-                            // y: parent.height - 24px;
-                            width: 100%;
-                            height: 22px;
-                            minimum: 0.0;
-                            maximum: root.duration-secs * 1.0;
-                            value: root.position-secs * 1.0;
-                            enabled: root.has-session && root.can-seek;
-                            released => { root.seek-to(self.value); }
+                        HorizontalLayout {
+                            alignment: end;
+                            spacing: 4px;
+
+                            IconButton {
+                                icon: @image-url("../assets/icons/replay_10.svg");
+                                active: root.has-session && root.can-seek;
+                                clicked => { root.seek-backward(); }
+                            }
+
+                            IconButton {
+                                icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
+                                active: root.has-session && root.can-toggle;
+                                clicked => { root.toggle-play-pause(); }
+                            }
+
+                            IconButton {
+                                icon: @image-url("../assets/icons/forward_10.svg");
+                                active: root.has-session && root.can-seek;
+                                clicked => { root.seek-forward(); }
+                            }
+
+                            // Abre y cierra el panel de emparejamiento.
+                            IconButton {
+                                icon: @image-url("../assets/icons/link.svg");
+                                icon-size: 20px;
+                                // El color muestra si el panel está abierto. No
+                                // se usa `active`: ese flag hace que el botón
+                                // ignore los clics, y este tiene que poder
+                                // cerrar el panel.
+                                tint: root.net-open ? #7c7cff : #f2f2f6;
+                                clicked => {
+                                    root.net-open = !root.net-open;
+                                    root.net-toggled();
+                                }
+                            }
+
+                            IconButton {
+                                icon: @image-url("../assets/icons/close.svg");
+                                icon-size: 15px;
+                                tint: #e2e2ea;
+                                clicked => { root.quit(); }
+                            }
                         }
                     }
 
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 4px;
-
-                        IconButton {
-                            icon: @image-url("../assets/icons/replay_10.svg");
-                            active: root.has-session && root.can-seek;
-                            clicked => { root.seek-backward(); }
-                        }
-
-                        IconButton {
-                            icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
-                            active: root.has-session && root.can-toggle;
-                            clicked => { root.toggle-play-pause(); }
-                        }
-
-                        IconButton {
-                            icon: @image-url("../assets/icons/forward_10.svg");
-                            active: root.has-session && root.can-seek;
-                            clicked => { root.seek-forward(); }
-                        }
-
-                        // Abre y cierra el panel de emparejamiento.
-                        IconButton {
-                            icon: @image-url("../assets/icons/link.svg");
-                            icon-size: 20px;
-                            // El color muestra si el panel está abierto. No
-                            // se usa `active`: ese flag hace que el botón
-                            // ignore los clics, y este tiene que poder
-                            // cerrar el panel.
-                            tint: root.net-open ? #7c7cff : #f2f2f6;
-                            clicked => {
-                                root.net-open = !root.net-open;
-                                root.net-toggled();
-                            }
-                        }
-
-                        IconButton {
-                            icon: @image-url("../assets/icons/close.svg");
-                            icon-size: 15px;
-                            tint: #e2e2ea;
-                            clicked => { root.quit(); }
-                        }
+                    // Línea de progreso: un slider para buscar posición, a lo
+                    // ancho completo de la barra.
+                    Slider {
+                        width: 100%;
+                        height: 22px;
+                        minimum: 0.0;
+                        maximum: root.duration-secs * 1.0;
+                        value: root.position-secs * 1.0;
+                        enabled: root.has-session && root.can-seek;
+                        released => { root.seek-to(self.value); }
                     }
                 }
             }

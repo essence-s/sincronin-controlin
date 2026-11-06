@@ -26,7 +26,7 @@ pub trait UiPort: Send + Sync + 'static {
     /// Texto de estado de la conexión.
     fn set_state_text(&self, text: String);
 
-    /// Texto del rol asignado (controlado / controlador).
+    /// Texto del rol asignado (anfitrión / invitado).
     fn set_role_text(&self, text: String);
 
     /// Código de sala de este cliente.

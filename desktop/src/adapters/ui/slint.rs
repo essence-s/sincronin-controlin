@@ -14,15 +14,17 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use crate::domain::media::{PlaybackState, Snapshot};
 use crate::domain::messages::RemoteState;
 use crate::domain::room::Role;
-use crate::platform;
 use crate::ports::{AppPort, UiPort};
 use crate::{AppWindow, MediaSession};
 
 /// Cuántas líneas guarda el registro de la ventana de red.
 const MAX_LOG_LINES: usize = 40;
 
-/// El mensaje que manda el botón de prueba del panel.
-const TEST_MESSAGE: &str = "hola";
+/// El panel de Conexión en el menú lateral.
+///
+/// Abrirlo es lo que entra a la sala propia: el código que muestra tiene que
+/// estar vivo para que el otro equipo pueda unirse.
+const PANEL_CONNECTION: i32 = 1;
 
 /// Adaptador de UI.
 pub struct SlintAdapter {
@@ -89,29 +91,10 @@ impl SlintAdapter {
 
         {
             let app = Arc::clone(&app);
-            ui.on_send_message(move || app.send_message(TEST_MESSAGE.to_string()));
-        }
-
-        {
-            let app = Arc::clone(&app);
-            let weak = ui.as_weak();
-            ui.on_net_toggled(move || {
-                let Some(ui) = weak.upgrade() else {
-                    return;
-                };
-
-                platform::configure(&ui);
-                app.panel_toggled(ui.get_net_open());
-            });
-        }
-
-        {
-            let weak = ui.as_weak();
-            ui.on_quit(move || {
-                if let Some(ui) = weak.upgrade() {
-                    let _ = ui.hide();
+            ui.on_panel_changed(move |panel: i32| {
+                if panel == PANEL_CONNECTION {
+                    app.panel_toggled(true);
                 }
-                let _ = slint::quit_event_loop();
             });
         }
     }
@@ -162,14 +145,7 @@ impl UiPort for SlintAdapter {
     }
 
     fn open_panel(&self) {
-        self.run(|ui| {
-            if ui.get_net_open() {
-                return;
-            }
-
-            ui.set_net_open(true);
-            platform::configure(ui);
-        });
+        self.run(|ui| ui.set_active_panel(PANEL_CONNECTION));
     }
 }
 

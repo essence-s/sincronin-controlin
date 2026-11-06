@@ -15,7 +15,6 @@ use crate::services::state::StateService;
 pub struct AppController<M: MediaPort, N: NetPort + Clone> {
     state: Arc<Mutex<StateService<M, N>>>,
     pairing: PairingService<N>,
-    net: N,
     ui: Arc<dyn UiPort>,
 }
 
@@ -24,15 +23,9 @@ impl<M: MediaPort, N: NetPort + Clone> AppController<M, N> {
     pub fn new(
         state: Arc<Mutex<StateService<M, N>>>,
         pairing: PairingService<N>,
-        net: N,
         ui: Arc<dyn UiPort>,
     ) -> Self {
-        Self {
-            state,
-            pairing,
-            net,
-            ui,
-        }
+        Self { state, pairing, ui }
     }
 
     /// Ejecuta un comando de reproducción en el servicio de estado.
@@ -90,10 +83,6 @@ impl<M: MediaPort, N: NetPort + Clone> AppPort for AppController<M, N> {
 
     fn disconnect(&self) {
         self.pairing.disconnect();
-    }
-
-    fn send_message(&self, text: String) {
-        self.net.send_data(text);
     }
 
     fn panel_toggled(&self, open: bool) {
@@ -229,7 +218,7 @@ mod tests {
             ui.clone(),
         )));
         let pairing = PairingService::new(net.clone());
-        let controller = AppController::new(Arc::clone(&state), pairing, net.clone(), ui.clone());
+        let controller = AppController::new(Arc::clone(&state), pairing, ui.clone());
 
         Harness {
             controller,

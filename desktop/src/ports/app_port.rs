@@ -30,9 +30,6 @@ pub trait AppPort: Send + Sync + 'static {
     /// Sale de la sala actual.
     fn disconnect(&self);
 
-    /// Manda un mensaje de prueba por el canal de datos.
-    fn send_message(&self, text: String);
-
     /// El panel de emparejamiento se abrió (`true`) o se cerró (`false`).
     fn panel_toggled(&self, open: bool);
 }

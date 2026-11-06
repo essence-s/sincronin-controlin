@@ -62,12 +62,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     }
 
     // ── Entrada de la UI → servicios ──────────────────────────────────
-    let app = Arc::new(AppController::new(
-        Arc::clone(&state),
-        pairing,
-        net,
-        ui_port,
-    ));
+    let app = Arc::new(AppController::new(Arc::clone(&state), pairing, ui_port));
     SlintAdapter::wire(&ui, app);
 
     platform::configure(&ui);

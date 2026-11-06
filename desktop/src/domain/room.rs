@@ -9,10 +9,13 @@ pub enum Role {
 
 impl Role {
     /// El texto para la UI.
+    ///
+    /// El controlado es el anfitrión: comparte su reproducción y su sala. El
+    /// controlador es el invitado, que se une a esa sala para manejarla.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Controlado => "controlado",
-            Self::Controlador => "controlador",
+            Self::Controlado => "Anfitrión",
+            Self::Controlador => "Invitado",
         }
     }
 }

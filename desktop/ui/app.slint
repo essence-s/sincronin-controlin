@@ -16,6 +16,18 @@ component CodeField inherits Rectangle {
     // Se dispara al apretar Enter: para conectar escribiendo el código.
     callback accepted();
 
+    // Copia todo el contenido al portapapeles.
+    //
+    // Slint no tiene una API de portapapeles aparte: la copia la hace el
+    // `TextInput` sobre lo que tenga seleccionado. Por eso se selecciona
+    // todo, se copia y se limpia la selección (si no, el código queda
+    // marcado en azul).
+    public function copy-text() {
+        input.select-all();
+        input.copy();
+        input.clear-selection();
+    }
+
     height: 30px;
     border-radius: 6px;
     background: #ffffff10;
@@ -63,12 +75,21 @@ component IconButton inherits Rectangle {
     in property <brush> tint: #f2f2f6;
     in property <length> icon-size: 22px;
     in property <bool> active: true;
+    // El botón es el elegido: lo usa el menú lateral para marcar el panel
+    // que se está viendo.
+    in property <bool> selected: false;
+    // Sin fondo salvo al pasar el mouse: para acciones secundarias (copiar,
+    // desconectar) que no deben competir con el resto.
+    in property <bool> flat: false;
     callback clicked();
 
     width: 34px;
     height: 34px;
     border-radius: 9px;
-    background: touch.pressed ? #55555b : (touch.has-hover ? #2d2d2f : #353539);
+    background: root.selected
+        ? #7c7cff2e
+        : root.flat ? (touch.pressed ? #ffffff1f : (touch.has-hover ? #ffffff10 : transparent))
+        : (touch.pressed ? #55555b : (touch.has-hover ? #2d2d2f : #353539));
     opacity: root.active ? 1 : 0.35;
 
     touch := TouchArea {
@@ -90,10 +111,7 @@ component IconButton inherits Rectangle {
     }
 }
 
-// Botón con texto.
-//
-// La barra no tiene botones con texto (son todos íconos), pero la ventana
-// de emparejamiento sí: son acciones que conviene leer.
+// Botón con texto, para las acciones que conviene leer (Conectar).
 //
 // El botón se ajusta al texto: el `Text` va directo (no en un layout) para
 // que su ancho sea el natural y no dependa del botón. Un `Rectangle` en un
@@ -167,32 +185,72 @@ component SessionChip inherits Rectangle {
     }
 }
 
+// Un panel del área central, con la animación de entrada.
+//
+// Slint no anima un elemento que se acaba de crear, así que los tres paneles
+// existen siempre y lo único que cambia es cuál está visible. Para que la
+// animación corra, el contenido arranca abajo y transparente y recién en el
+// cuadro siguiente se le pide que suba: el cambio de valor es lo que dispara
+// el `animate`.
+component PanelSlot inherits Rectangle {
+    in property <bool> active: false;
+    in-out property <bool> revealed: false;
+
+    // Solo el panel activo existe para el mouse: los otros dos no
+    // interceptan clics ni el teclado.
+    visible: root.active;
+    clip: true;
+
+    content := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        y: root.revealed ? 0px : 12px;
+        opacity: root.revealed ? 1 : 0;
+        animate y { duration: 250ms; easing: ease-out; }
+        animate opacity { duration: 250ms; easing: ease-out; }
+
+        @children
+    }
+
+    // Un cuadro de espera: es el que deja el panel ya visible, abajo y
+    // transparente, antes de animarlo a su lugar. No consulta nada, solo
+    // destraba la animación.
+    Timer {
+        interval: 16ms;
+        running: root.active && !root.revealed;
+        triggered => { root.revealed = true; }
+    }
+
+    changed active => {
+        if !root.active {
+            root.revealed = false;
+        }
+    }
+}
+
 // La ventana de la app.
 //
-// Son dos cosas en una sola ventana: la barra de siempre (420x84) y, arriba
-// de ella, el panel de emparejamiento por WebRTC.
+// A la izquierda el panel activo; a la derecha el menú con los tres paneles
+// (Controles, Conexión y Configuración). Los tres comparten el mismo ancho y
+// alto, así que la ventana no cambia de tamaño al cambiar de panel y el
+// compositor no tiene que re-anclarla.
 //
 // Una sola ventana a propósito: en Wayland no se puede "mostrar" una
 // ventana después de crearla (winit no puede mapear una superficie que ya
-// existe), asi que una segunda ventana Slint solo aparecería si se muestra
-// antes de que arranque el event loop. Con una ventana sola no hay nada que
-// mostrar ni esconder: la ventana crece y el compositor la re-ancla abajo.
+// existe), así que una segunda ventana Slint solo aparecería si se muestra
+// antes de que arranque el event loop.
 export component AppWindow inherits Window {
     title: "sincronin-controlin";
     no-frame: true;
     always-on-top: true;
     background: transparent;
 
-    // El ancho no cambia nunca, para que la barra no se corra de lugar.
+    // El tamaño no cambia nunca: los tres paneles miden lo mismo.
     width: 420px;
-    // Con el panel abierto la ventana es más alta. El compositor la ancla
-    // abajo (la regla de Hyprland se re-aplica al redimensionar), asi que
-    // crece hacia arriba y la barra no se mueve.
-    height: root.net-open ? 424px : 112px;
+    height: 112px;
 
     // El alto que quiere la ventana. En Windows lo usa el backend para
-    // anclar la ventana abajo: el tamaño nativo todavia no se actualizó
-    // cuando la app pide el cambio.
+    // anclar la ventana abajo.
     out property <length> wanted-height: root.height;
 
     in-out property <string> track-title: "Esperando al reproductor…";
@@ -210,20 +268,37 @@ export component AppWindow inherits Window {
     in property <int> session-count: 0;
     in property <string> session-id: "";
 
-    // El panel de emparejamiento.
-    in-out property <bool> net-open: false;
     // El código de sala de este cliente.
     in property <string> room-code: "";
     // El código de sala del otro equipo: lo escribe el usuario.
     in-out property <string> peer-room: "";
     // El estado de la conexión.
     in property <string> state-text: "Desconectado";
-    // El rol asignado en la sala: controlado o controlador.
+    // El rol en la sala: Anfitrión (comparte su reproducción) o Invitado.
     in property <string> role-text: "";
-    // Todo lo que pasó: avisos y mensajes recibidos.
-    in property <string> log-text: "";
     // Si el canal de datos está abierto, se puede mandar.
     in property <bool> can-send: false;
+    // Los avisos y mensajes que publica la red. Ningún panel los muestra
+    // todavía: se guardan para cuando haya un lugar donde leerlos.
+    in property <string> log-text: "";
+
+    // Qué panel se ve: 0 = Controles, 1 = Conexión, 2 = Configuración.
+    in-out property <int> active-panel: 0;
+
+    // La línea de estado del panel de Conexión. Con el canal abierto se ve a
+    // qué sala se está conectado y con qué rol ("Conectado a 5F73R6
+    // (invitado)"); si no, el estado que publica la red.
+    pure function status-line() -> string {
+        if !root.can-send {
+            return root.state-text;
+        }
+        if root.role-text == "" {
+            return "Conectado a " + root.room-code;
+        }
+        return "Conectado a " + root.room-code + " (" + root.role-text.to-lowercase() + ")";
+    }
+
+    property <string> status-text: status-line();
 
     callback toggle-play-pause();
     callback seek-backward();
@@ -232,10 +307,9 @@ export component AppWindow inherits Window {
     callback select-session(string);
     callback connect(string);
     callback disconnect();
-    callback send-message();
-    // La ventana cambió de alto: hay que volver a anclarla.
-    callback net-toggled();
-    callback quit();
+    // Cambió el panel visible: el adaptador entra a la sala propia al abrir
+    // Conexión, para que el código que muestra esté vivo.
+    callback panel-changed(int);
 
     Rectangle {
         width: 100%;
@@ -250,270 +324,269 @@ export component AppWindow inherits Window {
         // con normalidad.
         WindowMoveArea { }
 
-        VerticalLayout {
-            x: 0;
-            y: 0;
+        HorizontalLayout {
             width: parent.width;
             height: parent.height;
             spacing: 0;
 
-            // El panel de emparejamiento, arriba de la barra.
-            if root.net-open: Rectangle {
-                vertical-stretch: 1;
+            // El área central: los tres paneles se apilan en el mismo lugar
+            // y `PanelSlot` deja visible solo el que está activo.
+            Rectangle {
+                horizontal-stretch: 1;
+                clip: true;
 
-                VerticalLayout {
-                    padding: 14px;
-                    spacing: 8px;
+                // ── Controles ──
+                PanelSlot {
+                    active: root.active-panel == 0;
 
-                    Text {
-                        text: "Emparejar con otro equipo";
-                        color: #f4f4f8;
-                        font-size: 15px;
-                    }
+                    VerticalLayout {
+                        padding-left: 18px;
+                        padding-right: 14px;
+                        spacing: 6px;
+                        alignment: center;
 
-                    Text {
-                        text: "Tu código de sala lo genera esta máquina. Pasáselo al otro equipo y apretá Conectar para esperarlo.";
-                        color: #8d8d99;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            cross-axis-alignment: center;
 
-                    // Nuestra sala. El campo es de solo lectura para que se
-                    // pueda seleccionar y copiar con el teclado.
-                    HorizontalLayout {
-                        spacing: 8px;
+                            // Título y artista: la mitad izquierda de la fila.
+                            VerticalLayout {
+                                width: 50%;
+                                horizontal-stretch: 1;
+                                alignment: center;
 
-                        Text {
-                            text: "Tu sala";
-                            color: #9a9aa6;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
+                                Text {
+                                    text: root.track-title;
+                                    color: root.has-session ? #f4f4f8 : #8d8d99;
+                                    font-size: 14px;
+                                    overflow: elide;
+                                }
 
-                        CodeField {
-                            text: root.room-code;
-                            read-only: true;
-                            font-size: 14px;
-                            horizontal-alignment: center;
-                            horizontal-stretch: 0;
-                            width: 110px;
-                        }
+                                Text {
+                                    text: root.track-artist;
+                                    color: #9a9aa6;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
 
-                        Text {
-                            text: "copialo y pasáselo";
-                            color: #6f6f7c;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                        }
-                    }
+                                // Selector de sesión: solo aparece cuando hay
+                                // más de una.
+                                if root.session-count > 1: HorizontalLayout {
+                                    horizontal-stretch: 0;
+                                    spacing: 5px;
+                                    padding-top: 5px;
 
-                    // La sala del otro equipo. Si se deja vacío, se entra a
-                    // la sala propia.
-                    HorizontalLayout {
-                        spacing: 8px;
+                                    for session in root.sessions: SessionChip {
+                                        label: session.label;
+                                        selected: session.id == root.session-id;
+                                        clicked => { root.select-session(session.id); }
+                                    }
+                                }
+                            }
 
-                        Text {
-                            text: "Sala del otro";
-                            color: #9a9aa6;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
+                            // Los controles, pegados al borde derecho.
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: 4px;
 
-                        CodeField {
-                            text <=> root.peer-room;
-                            placeholder: "código de 6 letras (o vacío = tu sala)";
-                            font-size: 13px;
-                            horizontal-stretch: 1;
-                            // Con Enter se conecta: no hace falta acertar
-                            // el botón.
-                            accepted => { root.connect(root.peer-room); }
-                        }
+                                IconButton {
+                                    icon: @image-url("../assets/icons/replay_10.svg");
+                                    active: root.has-session && root.can-seek;
+                                    clicked => { root.seek-backward(); }
+                                }
 
-                        ActionButton {
-                            label: "Conectar";
-                            clicked => { root.connect(root.peer-room); }
-                        }
-                    }
+                                IconButton {
+                                    icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
+                                    active: root.has-session && root.can-toggle;
+                                    clicked => { root.toggle-play-pause(); }
+                                }
 
-                    // El estado y las acciones.
-                    HorizontalLayout {
-                        spacing: 8px;
-
-                        Text {
-                            text: root.state-text;
-                            color: #d6d6e0;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-
-                        Text {
-                            text: root.role-text;
-                            color: #7c7cff;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-
-                        ActionButton {
-                            label: "Enviar hola";
-                            active: root.can-send;
-                            clicked => { root.send-message(); }
-                        }
-
-                        ActionButton {
-                            label: "Desconectar";
-                            clicked => { root.disconnect(); }
-                        }
-
-                        ActionButton {
-                            label: "Cerrar";
-                            clicked => {
-                                root.net-open = false;
-                                root.net-toggled();
+                                IconButton {
+                                    icon: @image-url("../assets/icons/forward_10.svg");
+                                    active: root.has-session && root.can-seek;
+                                    clicked => { root.seek-forward(); }
+                                }
                             }
                         }
-                    }
 
-                    // El registro: los avisos y los mensajes que llegan.
-                    Rectangle {
-                        vertical-stretch: 1;
-                        border-radius: 8px;
-                        background: #ffffff08;
-                        border-width: 1px;
-                        border-color: #ffffff12;
-                        clip: true;
-
-                        Text {
-                            x: 10px;
-                            y: 8px;
-                            width: parent.width - 20px;
-                            height: parent.height - 16px;
-                            text: root.log-text;
-                            color: #b9b9c6;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                        // Línea de progreso: un slider para buscar posición, a
+                        // lo ancho completo del panel.
+                        Slider {
+                            width: 100%;
+                            height: 22px;
+                            minimum: 0.0;
+                            maximum: root.duration-secs * 1.0;
+                            value: root.position-secs * 1.0;
+                            enabled: root.has-session && root.can-seek;
+                            released => { root.seek-to(self.value); }
                         }
                     }
                 }
-            }
 
-            // La barra de siempre. Está en su propio rectángulo para que la
-            // línea de progreso sea relativa a la barra y no a la ventana
-            // (que crece).
-            Rectangle {
-                height: 112px;
+                // ── Conexión ──
+                PanelSlot {
+                    active: root.active-panel == 1;
 
-                // Contenido: título y artista a la izquierda, botones a la
-                // derecha, en la fila de arriba. El slider va debajo, a lo
-                // ancho completo para que sea más largo.
-                VerticalLayout {
-                    width: parent.width;
-                    height: parent.height;
-                    alignment: center;
-                    spacing: 6px;
-                    padding-left: 18px;
-                    padding-right: 18px;
+                    VerticalLayout {
+                        padding-left: 16px;
+                        padding-right: 14px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 5px;
+                        alignment: center;
 
-                    HorizontalLayout {
-                        // width: parent.width;
-                        // padding-left: 18px;
-                        // padding-right: 14px;
-                        spacing: 12px;
-                        cross-axis-alignment: center;
-
-                        VerticalLayout {
-                            width: 50%;
-                            horizontal-stretch: 1;
-                            alignment: center;
-                            // spacing: 1px;
+                        // Tu sala: el código y el botón que lo copia.
+                        HorizontalLayout {
+                            spacing: 8px;
+                            cross-axis-alignment: center;
 
                             Text {
-                                text: root.track-title;
-                                color: root.has-session ? #f4f4f8 : #8d8d99;
-                                font-size: 14px;
-                                overflow: elide;
-                            }
-
-                            Text {
-                                text: root.track-artist;
-                                color: #9a9aa6;
+                                text: "Tu código";
+                                width: 64px;
+                                color: #7d7d89;
                                 font-size: 11px;
-                                overflow: elide;
+                                vertical-alignment: center;
                             }
 
-                            // Selector de sesión: solo aparece cuando hay más de una.
-                            if root.session-count > 1: HorizontalLayout {
-                                horizontal-stretch: 0;
-                                spacing: 5px;
-                                padding-top: 5px;
+                            code := CodeField {
+                                text: root.room-code;
+                                read-only: true;
+                                font-size: 14px;
+                                horizontal-alignment: center;
+                                horizontal-stretch: 1;
+                            }
 
-                                for session in root.sessions: SessionChip {
-                                    label: session.label;
-                                    selected: session.id == root.session-id;
-                                    clicked => { root.select-session(session.id); }
-                                }
+                            IconButton {
+                                icon: @image-url("../assets/icons/content_copy.svg");
+                                icon-size: 15px;
+                                width: 30px;
+                                height: 30px;
+                                flat: true;
+                                clicked => { code.copy-text(); }
                             }
                         }
 
+                        // La sala del otro equipo: se escribe y se conecta.
                         HorizontalLayout {
-                            alignment: end;
-                            spacing: 4px;
+                            spacing: 8px;
+                            cross-axis-alignment: center;
 
-                            IconButton {
-                                icon: @image-url("../assets/icons/replay_10.svg");
-                                active: root.has-session && root.can-seek;
-                                clicked => { root.seek-backward(); }
+                            Text {
+                                text: "Otro equipo";
+                                width: 64px;
+                                color: #7d7d89;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+
+                            CodeField {
+                                text <=> root.peer-room;
+                                placeholder: "código";
+                                horizontal-stretch: 1;
+                                // Con Enter se conecta: no hace falta acertar
+                                // el botón.
+                                accepted => { root.connect(root.peer-room); }
+                            }
+
+                            ActionButton {
+                                label: "Conectar";
+                                clicked => { root.connect(root.peer-room); }
+                            }
+                        }
+
+                        // El estado, con un punto que dice si hay canal, y la
+                        // salida de la sala.
+                        HorizontalLayout {
+                            spacing: 6px;
+                            cross-axis-alignment: center;
+
+                            Rectangle {
+                                width: 5px;
+                                height: 5px;
+                                border-radius: 3px;
+                                background: root.can-send ? #6ee7a8 : #5c5c66;
+                            }
+
+                            Text {
+                                text: root.status-text;
+                                color: #a9a9b6;
+                                font-size: 11px;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
 
                             IconButton {
-                                icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
-                                active: root.has-session && root.can-toggle;
-                                clicked => { root.toggle-play-pause(); }
-                            }
-
-                            IconButton {
-                                icon: @image-url("../assets/icons/forward_10.svg");
-                                active: root.has-session && root.can-seek;
-                                clicked => { root.seek-forward(); }
-                            }
-
-                            // Abre y cierra el panel de emparejamiento.
-                            IconButton {
-                                icon: @image-url("../assets/icons/link.svg");
-                                icon-size: 20px;
-                                // El color muestra si el panel está abierto. No
-                                // se usa `active`: ese flag hace que el botón
-                                // ignore los clics, y este tiene que poder
-                                // cerrar el panel.
-                                tint: root.net-open ? #7c7cff : #f2f2f6;
-                                clicked => {
-                                    root.net-open = !root.net-open;
-                                    root.net-toggled();
-                                }
-                            }
-
-                            IconButton {
-                                icon: @image-url("../assets/icons/close.svg");
-                                icon-size: 15px;
-                                tint: #e2e2ea;
-                                clicked => { root.quit(); }
+                                icon: @image-url("../assets/icons/logout.svg");
+                                icon-size: 14px;
+                                width: 24px;
+                                height: 24px;
+                                flat: true;
+                                clicked => { root.disconnect(); }
                             }
                         }
                     }
+                }
 
-                    // Línea de progreso: un slider para buscar posición, a lo
-                    // ancho completo de la barra.
-                    Slider {
-                        width: 100%;
-                        height: 22px;
-                        minimum: 0.0;
-                        maximum: root.duration-secs * 1.0;
-                        value: root.position-secs * 1.0;
-                        enabled: root.has-session && root.can-seek;
-                        released => { root.seek-to(self.value); }
+                // ── Configuración (reservado) ──
+                PanelSlot {
+                    active: root.active-panel == 2;
+                }
+            }
+
+            // La línea que separa el panel del menú.
+            Rectangle {
+                width: 1px;
+                background: #ffffff14;
+            }
+
+            // El menú lateral: tres botones de ícono, apilados y del mismo
+            // tamaño.
+            Rectangle {
+                width: 54px;
+
+                // Tres botones de 30 px: con 112 px de alto, tres de 34 más
+                // la separación no entran.
+                VerticalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding: 6px;
+                    spacing: 4px;
+                    alignment: center;
+
+                    IconButton {
+                        icon: @image-url("../assets/icons/tune.svg");
+                        icon-size: 17px;
+                        width: 30px;
+                        height: 30px;
+                        selected: root.active-panel == 0;
+                        tint: root.active-panel == 0 ? #a9a9ff : #f2f2f6;
+                        clicked => { root.active-panel = 0; }
+                    }
+
+                    IconButton {
+                        icon: @image-url("../assets/icons/link.svg");
+                        icon-size: 17px;
+                        width: 30px;
+                        height: 30px;
+                        selected: root.active-panel == 1;
+                        tint: root.active-panel == 1 ? #a9a9ff : #f2f2f6;
+                        clicked => { root.active-panel = 1; }
+                    }
+
+                    IconButton {
+                        icon: @image-url("../assets/icons/settings.svg");
+                        icon-size: 17px;
+                        width: 30px;
+                        height: 30px;
+                        selected: root.active-panel == 2;
+                        tint: root.active-panel == 2 ? #a9a9ff : #f2f2f6;
+                        clicked => { root.active-panel = 2; }
                     }
                 }
             }
         }
     }
+
+    changed active-panel => { root.panel-changed(root.active-panel); }
 }

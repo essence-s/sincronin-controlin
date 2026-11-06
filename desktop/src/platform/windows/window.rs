@@ -49,7 +49,7 @@ fn attempt(weak: slint::Weak<AppWindow>, attempt_n: u32) {
 
     if let Some(hwnd) = hwnd {
         apply_styles(hwnd);
-        position_bottom_center(&ui);
+        reposition(&ui);
         return;
     }
 
@@ -99,7 +99,13 @@ fn apply_styles(hwnd: HWND) {
     }
 }
 
-fn position_bottom_center(ui: &AppWindow) {
+/// Reancla la ventana abajo al centro del área de trabajo.
+///
+/// Se llama al arrancar y cada vez que cambia el ancho (al abrir Controles o
+/// volver a un panel compacto). Usa el tamaño *querido* por la UI y no el
+/// nativo: cuando llega el aviso, la ventana de winit todavía puede tener el
+/// tamaño anterior.
+pub fn reposition(ui: &AppWindow) {
     let mut area = RECT::default();
     let ok = unsafe {
         SystemParametersInfoW(
@@ -113,19 +119,13 @@ fn position_bottom_center(ui: &AppWindow) {
         return;
     }
 
-    // El alto que *quiere* la ventana, no el que tiene: cuando se abre el
-    // panel de emparejamiento la app pide una ventana más alta, pero la
-    // nativa todavía no se redimensionó cuando llega acá. Con el alto viejo
-    // la ventana quedaría medio fuera de la pantalla.
     let scale = ui.window().scale_factor();
-    let height = (ui.get_wanted_height() * scale).round() as u32;
-
-    // El ancho no cambia nunca, así que el nativo sirve.
-    let width = ui.window().size().width;
+    let width = (ui.get_wanted_width() * scale).round() as i32;
+    let height = (ui.get_wanted_height() * scale).round() as i32;
 
     let available = area.right - area.left;
-    let x = area.left + (available - width as i32) / 2;
-    let y = area.bottom - height as i32 - BOTTOM_MARGIN;
+    let x = area.left + (available - width) / 2;
+    let y = area.bottom - height - BOTTOM_MARGIN;
 
     ui.window().set_position(slint::PhysicalPosition::new(x, y));
 }

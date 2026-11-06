@@ -18,7 +18,7 @@ use crate::adapters::media::MediaAdapter;
 use crate::adapters::net::NetAdapter;
 use crate::adapters::ui::slint::SlintAdapter;
 use crate::platform;
-use crate::ports::{MediaPort, NetPort, UiPort};
+use crate::ports::{AppPort, MediaPort, NetPort, UiPort};
 use crate::services::controller::AppController;
 use crate::services::pairing::PairingService;
 use crate::services::state::StateService;
@@ -62,8 +62,24 @@ pub fn run() -> Result<(), slint::PlatformError> {
     }
 
     // ── Entrada de la UI → servicios ──────────────────────────────────
-    let app = Arc::new(AppController::new(Arc::clone(&state), pairing, ui_port));
-    SlintAdapter::wire(&ui, app);
+    let app: Arc<dyn AppPort> = Arc::new(AppController::new(Arc::clone(&state), pairing, ui_port));
+    SlintAdapter::wire(&ui, Arc::clone(&app));
+
+    // La app arranca en Conexión: se entra a la sala propia sin esperar a
+    // que el usuario cambie de panel. Es el mismo camino que dispara abrir
+    // Conexión desde el menú.
+    app.panel_toggled(true);
+
+    // Al cambiar de panel cambia el ancho de la ventana. En Windows hay que
+    // volver a anclarla abajo al centro; en Linux el compositor manda.
+    {
+        let weak = ui.as_weak();
+        ui.on_size_changed(move || {
+            if let Some(ui) = weak.upgrade() {
+                platform::reposition(&ui);
+            }
+        });
+    }
 
     platform::configure(&ui);
 

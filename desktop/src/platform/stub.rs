@@ -78,3 +78,6 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
 /// Existe para que [`crate::app`] pueda llamar a `configure` sin saber en qué
 /// plataforma está — el despacho vive en [`super`].
 pub fn configure(_ui: &AppWindow) {}
+
+/// Lo mismo para el reanclaje: en el stub no hay ventana nativa que mover.
+pub fn reposition(_ui: &AppWindow) {}

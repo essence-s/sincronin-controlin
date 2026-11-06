@@ -262,12 +262,15 @@ export component AppWindow inherits Window {
     always-on-top: true;
     background: transparent;
 
-    // El tamaño no cambia nunca: los tres paneles miden lo mismo.
-    width: 420px;
+    // La ventana es compacta por defecto. Controles es el único panel que
+    // necesita el ancho grande; Conexión y Configuración comparten los
+    // 155 px (112 de contenido + 42 de menú + 1 de separador).
+    width: root.active-panel == 0 ? 420px : 155px;
     height: 112px;
 
-    // El alto que quiere la ventana. En Windows lo usa el backend para
-    // anclar la ventana abajo.
+    // El tamaño que quiere la ventana. En Windows lo usa el backend para
+    // reanclar la ventana abajo al centro cuando cambia el ancho.
+    out property <length> wanted-width: root.width;
     out property <length> wanted-height: root.height;
 
     in-out property <string> track-title: "Esperando al reproductor…";
@@ -300,7 +303,9 @@ export component AppWindow inherits Window {
     in property <string> log-text: "";
 
     // Qué panel se ve: 0 = Controles, 1 = Conexión, 2 = Configuración.
-    in-out property <int> active-panel: 0;
+    // Arranca en Conexión para que el código de sala esté disponible desde
+    // el inicio, sin ocupar el ancho de Controles.
+    in-out property <int> active-panel: 1;
 
     // La etiqueta de la tarjeta del código: con el canal abierto dice el rol
     // ("CONECTADO · INVITADO"); si no, el estado que publica la red. La sala
@@ -325,6 +330,9 @@ export component AppWindow inherits Window {
     // Cambió el panel visible: el adaptador entra a la sala propia al abrir
     // Conexión, para que el código que muestra esté vivo.
     callback panel-changed(int);
+    // Cambió el ancho de la ventana (o sea, el panel activo): el backend de
+    // plataforma la vuelve a anclar.
+    callback size-changed();
 
     Rectangle {
         width: 100%;
@@ -603,4 +611,5 @@ export component AppWindow inherits Window {
     }
 
     changed active-panel => { root.panel-changed(root.active-panel); }
+    changed width => { root.size-changed(); }
 }

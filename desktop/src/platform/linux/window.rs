@@ -40,3 +40,8 @@ use crate::AppWindow;
 
 /// No hay nada que ajustar: en Wayland lo decide el compositor.
 pub fn configure(_ui: &AppWindow) {}
+
+/// En Wayland el compositor es el dueño de la posición. No hay forma de
+/// pedirle que recentre la ventana cuando cambia el ancho: la regla de
+/// Hyprland se encarga de ubicarla al abrirla.
+pub fn reposition(_ui: &AppWindow) {}

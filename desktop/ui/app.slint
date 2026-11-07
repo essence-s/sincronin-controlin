@@ -42,8 +42,9 @@ component CodeField inherits Rectangle {
     clip: true;
 
     // El texto de ejemplo, mientras no hay nada escrito.
-    if root.text == "" && root.placeholder != "": Text {
+    if root.text == "" && root.placeholder != "": txt := Text {
         x: root.bare ? 0px : 8px;
+        y: ((root.height - txt.height) / 2) - 1px;
         text: root.placeholder;
         color: #6f6f7c;
         font-size: root.font-size;
@@ -138,14 +139,17 @@ component CodeCopyRow inherits HorizontalLayout {
     in property <bool> can-send: false;
     callback copied();
 
-    spacing: 6px;
+    spacing: 1px;
     cross-axis-alignment: center;
 
-    if root.show-dot: Rectangle {
-        width: 5px;
-        height: 5px;
-        border-radius: 2.5px;
-        background: root.can-send ? #6ee7a8 : #5c5c66;
+    if root.show-dot: VerticalLayout {
+        padding-right: 4px;
+        Rectangle {
+            width: 5px;
+            height: 5px;
+            border-radius: 2.5px;
+            background: root.can-send ? #6ee7a8 : #5c5c66;
+        }
     }
 
     code := CodeField {
@@ -166,6 +170,7 @@ component CodeCopyRow inherits HorizontalLayout {
         width: 22px;
         height: 22px;
         flat: true;
+        border-radius: 5px;
         clicked => { code.copy-text(); root.copied(); }
     }
 }
@@ -200,7 +205,7 @@ component SessionChip inherits Rectangle {
         color: root.selected ? #f4f4f8 : #7d7d89;
         font-size: 11px;
         x: 7px;
-        y: (root.height - txt.height) / 2;
+        y: ((root.height - txt.height) / 2) - 1px;
     }
 
     width: txt.width + 14px;
@@ -342,7 +347,7 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         border-radius: 14px;
-        background: @linear-gradient(180deg, #202021, #0d0d0d);
+        background: @linear-gradient(180deg, #202020, #090909);
         border-width: 1px;
         border-color: #ffffff18;
 
@@ -493,7 +498,7 @@ export component AppWindow inherits Window {
 
                             CodeField {
                                 horizontal-stretch: 1;
-                                height: 28px;
+                                height: 24px;
                                 text <=> root.peer-room;
                                 placeholder: "código";
                                 font-size: 12px;
@@ -505,8 +510,9 @@ export component AppWindow inherits Window {
                                 icon-size: 14px;
                                 tint: #dcdcff;
                                 width: 24px;
-                                height: 28px;
+                                height: 24px;
                                 primary: true;
+                                border-radius: 5px;
                                 clicked => { root.connect(root.peer-room); }
                             }
                         }
@@ -603,6 +609,7 @@ export component AppWindow inherits Window {
                                 width: 20px;
                                 height: 20px;
                                 flat: true;
+                                border-radius: 5px;
                                 clicked => { root.disconnect(); }
                             }
                         }
@@ -640,16 +647,6 @@ export component AppWindow inherits Window {
                     alignment: center;
 
                     IconButton {
-                        icon: @image-url("../assets/icons/tune.svg");
-                        icon-size: 17px;
-                        width: 30px;
-                        height: 30px;
-                        selected: root.active-panel == 0;
-                        tint: root.active-panel == 0 ? #a9a9ff : #f2f2f6;
-                        clicked => { root.active-panel = 0; }
-                    }
-
-                    IconButton {
                         icon: @image-url("../assets/icons/link.svg");
                         icon-size: 17px;
                         width: 30px;
@@ -657,6 +654,16 @@ export component AppWindow inherits Window {
                         selected: root.active-panel == 1;
                         tint: root.active-panel == 1 ? #a9a9ff : #f2f2f6;
                         clicked => { root.active-panel = 1; }
+                    }
+
+                    IconButton {
+                        icon: @image-url("../assets/icons/tune.svg");
+                        icon-size: 17px;
+                        width: 30px;
+                        height: 30px;
+                        selected: root.active-panel == 0;
+                        tint: root.active-panel == 0 ? #a9a9ff : #f2f2f6;
+                        clicked => { root.active-panel = 0; }
                     }
 
                     IconButton {

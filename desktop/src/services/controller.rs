@@ -202,7 +202,7 @@ mod tests {
 
         fn set_can_send(&self, _can: bool) {}
 
-        fn set_peer_count(&self, _count: usize) {}
+        fn set_room_count(&self, _count: usize) {}
 
         fn append_log(&self, _line: String) {}
 

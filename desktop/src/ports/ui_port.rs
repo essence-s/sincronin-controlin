@@ -38,11 +38,11 @@ pub trait UiPort: Send + Sync + 'static {
     /// Si el canal de datos está abierto (se puede enviar).
     fn set_can_send(&self, can: bool);
 
-    /// Cuántos equipos tienen el canal de datos abierto con este.
+    /// Cuántas personas hay en la sala, contando a esta.
     ///
     /// La vista de Conexión elige entre la de unión y la conectada con este
-    /// número: cero es "esperando a que alguien entre".
-    fn set_peer_count(&self, count: usize);
+    /// número: uno o cero es "solo", más de uno es "conectado".
+    fn set_room_count(&self, count: usize);
 
     /// Agrega una línea al registro del panel de red.
     fn append_log(&self, line: String);

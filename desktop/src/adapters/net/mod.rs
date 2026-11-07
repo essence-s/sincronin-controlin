@@ -132,7 +132,7 @@ fn translate(event: NetRawEvent) -> NetEvent {
             RawRole::Controlado => DomainRole::Controlado,
             RawRole::Controlador => DomainRole::Controlador,
         }),
-        NetRawEvent::PeerCount(count) => NetEvent::PeerCount(count),
+        NetRawEvent::RoomCount(count) => NetEvent::RoomCount(count),
         NetRawEvent::ControlledMoved { room } => NetEvent::ControlledMoved { room },
         NetRawEvent::ControlledLeft => NetEvent::ControlledLeft,
     }
@@ -152,10 +152,10 @@ mod tests {
     }
 
     #[test]
-    fn peer_count_is_translated() {
+    fn room_count_is_translated() {
         assert!(matches!(
-            translate(NetRawEvent::PeerCount(2)),
-            NetEvent::PeerCount(2)
+            translate(NetRawEvent::RoomCount(2)),
+            NetEvent::RoomCount(2)
         ));
     }
 

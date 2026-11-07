@@ -131,11 +131,11 @@ impl UiPort for SlintAdapter {
         self.run(move |ui| ui.set_can_send(can));
     }
 
-    fn set_peer_count(&self, count: usize) {
+    fn set_room_count(&self, count: usize) {
         // La UI cuenta con `int`: el `try_from` evita truncar si algún día
         // llegara un número absurdo.
         let count = i32::try_from(count).unwrap_or(i32::MAX);
-        self.run(move |ui| ui.set_peer_count(count));
+        self.run(move |ui| ui.set_room_count(count));
     }
 
     fn append_log(&self, line: String) {

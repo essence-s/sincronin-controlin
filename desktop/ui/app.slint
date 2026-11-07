@@ -265,9 +265,9 @@ export component AppWindow inherits Window {
     in property <string> role-text: "";
     // Si el canal de datos está abierto, se puede mandar.
     in property <bool> can-send: false;
-    // Cuántos equipos tienen el canal de datos abierto. Cero es la vista de
-    // unión, que espera a que alguien entre; uno o más, la vista conectada.
-    in property <int> peer-count: 0;
+    // Cuántas personas hay en la sala, contando a esta.
+    // Uno o cero es la vista de unión; más de uno, la vista conectada.
+    in property <int> room-count: 0;
     // Los avisos y mensajes que publica la red. Ningún panel los muestra
     // todavía: se guardan para cuando haya un lugar donde leerlos.
     in property <string> log-text: "";
@@ -405,12 +405,11 @@ export component AppWindow inherits Window {
 
                 // ── Conexión: vista de unión ──
                 //
-                // Mientras no hay equipos conectados. El contenido mide
-                // 112×112 px (155 menos los 42 del menú y el 1 del separador),
-                // así que el código, la "o" y el campo del otro equipo van en
-                // tres filas apretadas.
+                // Cuando estoy solo: el contenido mide 112×112 px (155 menos
+                // los 42 del menú y el 1 del separador), así que el código, la
+                // "o" y el campo del otro equipo van en tres filas apretadas.
                 PanelSlot {
-                    active: root.active-panel == 1 && root.peer-count == 0;
+                    active: root.active-panel == 1 && root.room-count <= 1;
                     VerticalLayout {
                         padding-left: 8px;
                         padding-right: 8px;
@@ -495,12 +494,12 @@ export component AppWindow inherits Window {
 
                 // ── Conexión: vista conectada ──
                 //
-                // Con al menos un equipo en el canal: la misma fila de la
-                // sala, el rol en una línea y las órbitas, una por equipo.
+                // Con otra persona en la sala: la misma fila de la sala, el
+                // rol en una línea y las órbitas, una por persona.
                 // El botón de desconectar va al costado de las órbitas: en la
                 // fila del código no entra.
                 PanelSlot {
-                    active: root.active-panel == 1 && root.peer-count > 0;
+                    active: root.active-panel == 1 && root.room-count > 1;
 
                     VerticalLayout {
                         padding-left: 8px;
@@ -549,17 +548,18 @@ export component AppWindow inherits Window {
                             spacing: 4px;
                             cross-axis-alignment: center;
 
-                            // Un círculo por equipo. `animation-tick` es el
-                            // reloj de animación de Slint, no un timer que
-                            // consulte nada: la órbita gira con el cuadro.
+                            // Una órbita por persona de la sala, incluido uno mismo.
+                            // `animation-tick` es el reloj de animación de Slint,
+                            // no un timer que consulte nada: la órbita gira con el
+                            // cuadro.
                             orbit := Rectangle {
                                 width: 48px;
                                 height: 48px;
                                 property <length> radius: 16px;
                                 property <angle> spin: 1turn * (animation-tick() / 1s);
 
-                                for i in root.peer-count: Rectangle {
-                                    property <angle> phase: orbit.spin + 1turn * (i * 1.0 / root.peer-count);
+                                for i in root.room-count: Rectangle {
+                                    property <angle> phase: orbit.spin + 1turn * (i * 1.0 / root.room-count);
                                     width: 14px;
                                     height: 14px;
                                     border-radius: 7px;

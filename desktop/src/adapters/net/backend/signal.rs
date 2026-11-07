@@ -184,6 +184,10 @@ fn connection_lost(
     }
 
     net::publish_notice(sink, reason);
+    // Si no volvimos a la sala que se cayó, publicamos cero: ya no estoy.
+    if rejoin.is_none() {
+        net::publish_room_count(sink, 0);
+    }
     session.forget();
     net::send_peer(peer_tx, PeerCommand::Stop);
 
@@ -232,6 +236,12 @@ struct Session {
     claim: bool,
     /// La sala a la que hay que volver, si se cayó la conexión.
     rejoin: Option<Rejoin>,
+    /// Cuántas personas hay en la sala, contando a esta.
+    ///
+    /// Solo vale mientras hay sesión: cuando se olvida (`forget`), se pierde
+    /// con ella. Se publica desde los mismos eventos que maneja esta sesión:
+    /// `joined`, `peerJoined`, `peerLeft`, y cero al irse.
+    members: usize,
 }
 
 /// La sala a la que hay que volver después de una caída.
@@ -258,6 +268,7 @@ impl Session {
             controlled: None,
             claim: false,
             rejoin: None,
+            members: 0,
         }
     }
 
@@ -270,6 +281,7 @@ impl Session {
         self.controlled = None;
         self.claim = false;
         self.rejoin = None;
+        self.members = 0;
     }
 
     /// La sala a la que hay que volver, si la conexión se cayó.
@@ -320,7 +332,11 @@ impl Session {
     }
 
     /// Se va de la sala, avisandole al servidor con protocolo.
-    fn leave(&mut self) {
+    ///
+    /// Publica cero antes de olvidarla, para que los demás sepan que ya no
+    /// estoy. El `forget` luego la deja en cero también, por si acaso.
+    fn leave(&mut self, sink: &Sink) {
+        net::publish_room_count(sink, 0);
         if let Some(socket) = self.ws.as_mut() {
             send_frame(socket, &Frame::new(ClientMessage::Leave));
             let _ = socket.close(None);
@@ -354,7 +370,7 @@ fn handle_command(session: &mut Session, cmd: Command, peer_tx: &Sender<PeerComm
         }
         Command::Disconnect => {
             // Avisamos al servidor para que le diga al otro equipo.
-            session.leave();
+            session.leave(sink);
             net::send_peer(peer_tx, PeerCommand::Stop);
             net::publish_state(sink, NetState::Desconectado);
             net::publish_notice(sink, "se cortó la conexión");
@@ -385,7 +401,7 @@ fn enter(
 
     // Si ya había una conexión, se cierra. Con protocolo, para que el
     // servidor no vea un reset.
-    session.leave();
+    session.leave(sink);
     net::send_peer(peer_tx, PeerCommand::Stop);
 
     match connect(room) {
@@ -509,6 +525,10 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
             // La sala ya está confirmada: no hay más que reintentar.
             session.rejoin = None;
 
+            // Quien estoy: yo, más los que ya estaban cuando entré.
+            session.members = 1 + peers.len();
+            net::publish_room_count(sink, session.members);
+
             // El primero de la sala es el controlado. El que llega después
             // es controlador, y espera que el controlado le ofrezca: no
             // hay que mirar quién tiene el identificador más chico.
@@ -544,6 +564,10 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
             eprintln!("[net] entró otro equipo (id {peer}) en la sala");
             net::publish_notice(sink, "llegó el otro equipo a la sala");
 
+            // Ya estoy en la sala: uno más.
+            session.members += 1;
+            net::publish_room_count(sink, session.members);
+
             // Solo el controlado ofrece: cada controlador abre su canal
             // con él, y dos controladores nunca se conectan entre sí.
             if session.controlado {
@@ -564,11 +588,16 @@ fn handle_server(session: &mut Session, text: &str, peer_tx: &Sender<PeerCommand
                 session.controlled = None;
                 net::publish_state(sink, NetState::Conectando);
                 net::publish_notice(sink, "el controlado se fue: esperando que vuelva");
+                // Los demás siguen en la sala, con uno menos.
+                session.members = session.members.saturating_sub(1);
+                net::publish_room_count(sink, session.members);
                 return;
             }
 
             // Se cae solo el par de ese equipo: los demás siguen como
             // estaban. Si vuelve, se empareja de nuevo.
+            session.members = session.members.saturating_sub(1);
+            net::publish_room_count(sink, session.members);
             net::send_peer(peer_tx, PeerCommand::Close { peer });
             net::publish_notice(sink, "el otro equipo se fue de la sala");
         }
@@ -728,6 +757,162 @@ mod tests {
         }
         offered.sort_unstable();
         offered
+    }
+
+    /// Los cierres de par que pidió el hilo de par, ordenados.
+    fn peer_lefts(rx: &Receiver<PeerCommand>) -> Vec<u64> {
+        let mut lefts = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                PeerCommand::Close { peer } => lefts.push(peer),
+                other => panic!("no era un cierre: {other:?}"),
+            }
+        }
+        lefts.sort_unstable();
+        lefts
+    }
+
+    /// El mensaje con el que el servidor anuncia la entrada de otro.
+    fn peer_joined(peer: u64) -> String {
+        let frame = Frame::new(ServerMessage::PeerJoined { peer });
+        serde_json::to_string(&frame).expect("el sobre se serializa")
+    }
+
+    /// El mensaje con el que el servidor anuncia la salida de otro.
+    fn peer_left(peer: u64) -> String {
+        let frame = Frame::new(ServerMessage::PeerLeft { peer });
+        serde_json::to_string(&frame).expect("el sobre se serializa")
+    }
+
+    /// Al entrar, el primero cuenta a sí mismo: uno.
+    #[test]
+    fn the_first_device_counts_itself() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        handle_server(&mut session, &joined("ROOM01", 1, &[]), &peer_tx, &sink);
+
+        let recorded = events.lock().expect("el registro no está poisoned");
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(1))),
+            "estoy solo: cuento uno; eventos: {recorded:?}"
+        );
+        assert!(peer_lefts(&peer_rx).is_empty(), "aún no se fue nadie");
+    }
+
+    /// Al entrar a una sala con gente, cuento a los que ya estaban más a mí.
+    #[test]
+    fn the_count_includes_the_devices_already_in_the_room() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        handle_server(&mut session, &joined("ROOM01", 1, &[3, 5]), &peer_tx, &sink);
+
+        let recorded = events.lock().expect("el registro no está poisoned");
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(3))),
+            "estoy con dos que ya estaban: tres; eventos: {recorded:?}"
+        );
+        assert!(peer_lefts(&peer_rx).is_empty(), "aún no se fue nadie");
+    }
+
+    /// Cuando llega otro, el número sube.
+    #[test]
+    fn another_device_joining_raises_the_count() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        handle_server(&mut session, &joined("ROOM01", 1, &[2]), &peer_tx, &sink);
+        assert!(
+            events
+                .lock()
+                .expect("el registro no está poisoned")
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(2))),
+            "yo + uno que ya estaba: dos"
+        );
+
+        // Llega otro.
+        handle_server(&mut session, &peer_joined(3), &peer_tx, &sink);
+        assert!(peer_lefts(&peer_rx).is_empty(), "todavía no se fue nadie");
+        let recorded = events.lock().expect("el registro no está poisoned");
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(3))),
+            "llegó otro: tres; eventos: {recorded:?}"
+        );
+    }
+
+    /// Cuando se va uno, el número baja.
+    #[test]
+    fn a_device_leaving_lowers_the_count() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        handle_server(&mut session, &joined("ROOM01", 1, &[2, 3]), &peer_tx, &sink);
+        assert!(
+            events
+                .lock()
+                .expect("el registro no está poisoned")
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(3))),
+            "yo + dos que ya estaban: tres"
+        );
+
+        // Se va uno de los que ya estaban.
+        handle_server(&mut session, &peer_left(2), &peer_tx, &sink);
+        assert_eq!(
+            peer_lefts(&peer_rx),
+            vec![2],
+            "se cerró el par del que se fue"
+        );
+        let recorded = events.lock().expect("el registro no está poisoned");
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(2))),
+            "se fue uno: dos; eventos: {recorded:?}"
+        );
+    }
+
+    /// Al desconectarme, publico cero.
+    #[test]
+    fn leaving_the_room_publishes_zero() {
+        let (sink, events) = recording_sink();
+        let (peer_tx, peer_rx) = crossbeam_channel::unbounded();
+
+        let mut session = Session::new();
+        handle_server(&mut session, &joined("ROOM01", 1, &[2]), &peer_tx, &sink);
+        assert!(
+            events
+                .lock()
+                .expect("el registro no está poisoned")
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(2))),
+            "yo + uno que ya estaba: dos"
+        );
+
+        handle_command(&mut session, Command::Disconnect, &peer_tx, &sink);
+        let recorded = events.lock().expect("el registro no está poisoned");
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(0))),
+            "al desconectarme: cero; eventos: {recorded:?}"
+        );
+        assert!(
+            matches!(peer_rx.try_recv(), Ok(PeerCommand::Stop)),
+            "avisé al par"
+        );
     }
 
     /// Una entrada normal a una sala con gente: controlador, y no ofrece

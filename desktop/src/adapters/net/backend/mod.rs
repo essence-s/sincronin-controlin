@@ -107,8 +107,14 @@ pub enum Event {
     Notice(String),
     /// El rol asignado en la sala: controlado o controlador.
     AssignedRole(Role),
-    /// Cuántos equipos tienen el canal de datos abierto con este.
-    PeerCount(usize),
+    /// Cuántas personas hay en la sala, contando a esta.
+    ///
+    /// Va por el canal de señalización, que es la única fuente que todos
+    /// los equipos pueden conocer igual: el servidor manda a quién ve cada
+    /// uno al entrar (`joined`), y a los que entran y salen después
+    /// (`PeerJoined`, `PeerLeft`). Por eso el anfitrión y cada invitado
+    /// llegan al mismo número.
+    RoomCount(usize),
     /// El controlado se fue a otra sala, avisando a dónde.
     ControlledMoved {
         /// La sala en la que está ahora.
@@ -338,9 +344,9 @@ pub(crate) fn publish_role(sink: &Sink, role: Role) {
     sink(Event::AssignedRole(role));
 }
 
-/// Publica cuántos equipos tienen el canal de datos abierto.
-pub(crate) fn publish_peer_count(sink: &Sink, count: usize) {
-    sink(Event::PeerCount(count));
+/// Publica cuántas personas hay en la sala.
+pub(crate) fn publish_room_count(sink: &Sink, count: usize) {
+    sink(Event::RoomCount(count));
 }
 
 /// Publica que el controlado se fue a otra sala.
@@ -405,6 +411,7 @@ mod tests {
 
     /// La sala de la prueba del conteo de canales.
     const PEER_COUNT_ROOM: &str = "N4P6QR";
+    const THREE_ROOM: &str = "T9R2KM";
     const THREE_ROOM_A: &str = "D7F9HJ";
     const THREE_ROOM_OTHER: &str = "E2G4KM";
     const THREE_FOLLOW_FROM_ROOM: &str = "F8H2KN";
@@ -1253,10 +1260,92 @@ mod tests {
         }
     }
 
-    /// El conteo sigue a los canales de datos: uno cuando el otro equipo
-    /// abre el suyo y cero cuando se va.
+    /// Cada equipo ve el mismo número de personas en la sala, y ese número
+    /// sube y baja igual para los tres cuando uno entra o sale.
     #[test]
-    fn the_backend_publishes_the_peer_count_of_open_channels() {
+    fn every_device_sees_the_same_room_count() {
+        let _ = test_server();
+
+        let (cmd_a, events_a) = client();
+        let (cmd_b, events_b) = client();
+        let (cmd_c, events_c) = client();
+
+        // A entra primero: es el controlado.
+        cmd_a
+            .send(Command::Connect {
+                room: THREE_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_a, is_controlado);
+        // A cuenta uno.
+        wait_for(&events_a, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(1)))
+        });
+
+        // B entra: A y B cuentan dos.
+        cmd_b
+            .send(Command::Connect {
+                room: THREE_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_b, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::AssignedRole(Role::Controlador)))
+        });
+        for events in [&events_a, &events_b] {
+            wait_for(events, |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::RoomCount(2)))
+            });
+        }
+
+        // C entra: los tres cuentan tres.
+        cmd_c
+            .send(Command::Connect {
+                room: THREE_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        wait_for(&events_c, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::AssignedRole(Role::Controlador)))
+        });
+        for events in [&events_a, &events_b, &events_c] {
+            wait_for(events, |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::RoomCount(3)))
+            });
+        }
+
+        // C se va: A y B cuentan dos; C cuenta cero.
+        cmd_c
+            .send(Command::Disconnect)
+            .expect("el canal de comandos está abierto");
+
+        for events in [&events_a, &events_b] {
+            wait_for(events, |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::RoomCount(2)))
+            });
+        }
+        wait_for(&events_c, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(0)))
+        });
+    }
+
+    /// El conteo de la sala: uno al entrar, dos cuando llega otro, y uno
+    /// cuando se va. Sale por la señalización, que es la única fuente que
+    /// todos los equipos pueden conocer igual.
+    #[test]
+    fn the_backend_publishes_the_room_count() {
         let _ = test_server();
 
         let (cmd_a, events_a) = client();
@@ -1268,25 +1357,33 @@ mod tests {
             })
             .expect("el canal de comandos está abierto");
         wait_for(&events_a, is_controlado);
+        // A entra solo: cuenta uno.
+        wait_for(&events_a, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::RoomCount(1)))
+        });
 
         cmd_b
             .send(Command::Connect {
                 room: PEER_COUNT_ROOM.to_string(),
             })
             .expect("el canal de comandos está abierto");
-        wait_for(&events_a, channel_opened);
-        wait_for(&events_b, channel_opened);
-
-        // Los dos ven un solo equipo conectado: el otro.
+        wait_for(&events_b, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::AssignedRole(Role::Controlador)))
+        });
+        // B entra: cuenta dos para los dos.
         for events in [&events_a, &events_b] {
             wait_for(events, |events| {
                 events
                     .iter()
-                    .any(|event| matches!(event, Event::PeerCount(1)))
+                    .any(|event| matches!(event, Event::RoomCount(2)))
             });
         }
 
-        // Y cuando el otro se va, el que se queda vuelve a cero.
+        // B se va: A cuenta uno.
         cmd_b
             .send(Command::Disconnect)
             .expect("el canal de comandos está abierto");
@@ -1294,7 +1391,7 @@ mod tests {
         wait_for(&events_a, |events| {
             events
                 .iter()
-                .any(|event| matches!(event, Event::PeerCount(0)))
+                .any(|event| matches!(event, Event::RoomCount(1)))
         });
     }
 

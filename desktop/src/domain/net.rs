@@ -40,11 +40,13 @@ pub enum NetEvent {
     Notice(String),
     /// El rol asignado en la sala: controlado o controlador.
     AssignedRole(Role),
-    /// Cuántos equipos tienen el canal de datos abierto con este.
+    /// Cuántas personas hay en la sala, contando a esta.
     ///
-    /// No incluye al equipo local: el controlado cuenta a sus controladores
-    /// y el controlador a su controlado (uno).
-    PeerCount(usize),
+    /// Va por la señalización: el servidor manda a quién ve cada uno al
+    /// entrar (`joined`), y a los que entran y salen después (`PeerJoined`,
+    /// `PeerLeft`). Por eso el anfitrión y cada invitado llegan al mismo
+    /// número.
+    RoomCount(usize),
     /// El controlado se fue a otra sala, avisando a dónde.
     ControlledMoved {
         /// La sala en la que está ahora.

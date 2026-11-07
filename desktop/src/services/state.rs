@@ -65,7 +65,7 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
         match event {
             NetEvent::State(state) => self.on_net_state(state, now),
             NetEvent::AssignedRole(role) => self.on_role(role, now),
-            NetEvent::PeerCount(count) => self.ui.set_peer_count(count),
+            NetEvent::RoomCount(count) => self.ui.set_room_count(count),
             NetEvent::Notice(text) => self.ui.append_log(format!("· {text}")),
             NetEvent::Message(text) => self.on_message(text, now),
             NetEvent::ControlledMoved { room } => {
@@ -149,11 +149,11 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
             if self.role == Some(Role::Controlado) {
                 self.send_cached_snapshot(now);
             }
-        } else {
+        } else if state == NetState::Desconectado {
             self.publisher = StatePublisher::new();
             self.pending = None;
-            // Sin conexión no hay equipos: la vista vuelve a la de unión.
-            self.ui.set_peer_count(0);
+            // Sin conexión no hay sala: la vista vuelve a la de unión.
+            self.ui.set_room_count(0);
 
             // Si se cierra el canal, el estado remoto deja de ser válido:
             // se vuelve a la reproducción local.
@@ -367,7 +367,7 @@ mod tests {
         room_codes: Mutex<Vec<String>>,
         peer_rooms: Mutex<Vec<String>>,
         can_send: Mutex<Vec<bool>>,
-        peer_counts: Mutex<Vec<usize>>,
+        room_counts: Mutex<Vec<usize>>,
         log: Mutex<Vec<String>>,
         open_panel: Mutex<usize>,
     }
@@ -422,8 +422,8 @@ mod tests {
                 .push(can);
         }
 
-        fn set_peer_count(&self, count: usize) {
-            self.peer_counts
+        fn set_room_count(&self, count: usize) {
+            self.room_counts
                 .lock()
                 .expect("la UI no está poisoned")
                 .push(count);
@@ -738,38 +738,60 @@ mod tests {
         assert!(!state.can_seek);
     }
 
+    /// El número llegó a la UI.
     #[test]
-    fn peer_count_rises_when_a_channel_opens() {
+    fn the_room_count_reaches_the_ui() {
         let mut h = harness();
         let now = Instant::now();
 
         h.service
             .on_net_event(NetEvent::State(NetState::Conectado), now);
-        h.service.on_net_event(NetEvent::PeerCount(1), now);
+        h.service.on_net_event(NetEvent::RoomCount(2), now);
 
         assert_eq!(
-            h.ui.peer_counts
+            h.ui.room_counts
                 .lock()
                 .expect("la UI no está poisoned")
                 .last()
                 .copied(),
-            Some(1)
+            Some(2)
         );
     }
 
+    /// En estado Conectando el número no se borra: alguien acaba de entrar.
     #[test]
-    fn peer_count_resets_when_the_connection_drops() {
+    fn a_connecting_state_keeps_the_room_count() {
+        let mut h = harness();
+        let now = Instant::now();
+
+        h.service.on_net_event(NetEvent::RoomCount(2), now);
+        h.service
+            .on_net_event(NetEvent::State(NetState::Conectando), now);
+
+        assert_eq!(
+            h.ui.room_counts
+                .lock()
+                .expect("la UI no está poisoned")
+                .last()
+                .copied(),
+            Some(2)
+        );
+    }
+
+    /// Al volver a Desconectado, el número se reinicia.
+    #[test]
+    fn room_count_resets_when_the_connection_drops() {
         let mut h = harness();
         let now = Instant::now();
 
         h.service
             .on_net_event(NetEvent::State(NetState::Conectado), now);
-        h.service.on_net_event(NetEvent::PeerCount(1), now);
+        h.service.on_net_event(NetEvent::RoomCount(2), now);
         h.service
             .on_net_event(NetEvent::State(NetState::Desconectado), now);
 
         assert_eq!(
-            h.ui.peer_counts
+            h.ui.room_counts
                 .lock()
                 .expect("la UI no está poisoned")
                 .last()

@@ -10,3 +10,4 @@ pub mod media;
 pub mod messages;
 pub mod net;
 pub mod room;
+pub mod window;

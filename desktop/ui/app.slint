@@ -284,8 +284,10 @@ export component AppWindow inherits Window {
     // La ventana es compacta por defecto. Controles es el único panel que
     // necesita el ancho grande; Conexión y Configuración comparten los
     // 155 px (112 de contenido + 42 de menú + 1 de separador).
-    width: root.active-panel == 0 ? 420px : 155px;
-    height: 112px;
+    // El círculo del modo discreto: la ventana entera, achicada y sin la
+    // interfaz, para no tapar lo que se está viendo a pantalla completa.
+    width: root.collapsed ? 44px : (root.active-panel == 0 ? 420px : 155px);
+    height: root.collapsed ? 44px : 112px;
 
     // El tamaño que quiere la ventana. En Windows lo usa el backend para
     // reanclar la ventana abajo al centro cuando cambia el ancho.
@@ -342,341 +344,391 @@ export component AppWindow inherits Window {
     // Cambió el ancho de la ventana (o sea, el panel activo): el backend de
     // plataforma la vuelve a anclar.
     callback size-changed();
+    // El puntero entró o salió de la ventana: la app reinicia la cuenta de
+    // inactividad, que es una regla del dominio.
+    callback pointer-entered();
+    callback pointer-left();
 
-    Rectangle {
+    // El mouse está sobre la ventana. Lo publica el sensor; mientras esté
+    // encima, la ventana no se achica.
+    property <bool> pointer-inside: sensor.has-hover;
+    // La ventana está achicada al círculo del modo discreto.
+    in-out property <bool> collapsed: false;
+
+    sensor := TouchArea {
         width: 100%;
         height: 100%;
-        border-radius: 14px;
-        background: @linear-gradient(180deg, #202020, #090909);
-        border-width: 1px;
-        border-color: #ffffff18;
 
-        // Toda la ventana se puede arrastrar. Los controles se declaran
-        // después, así que quedan por encima y siguen recibiendo sus clics
-        // con normalidad.
-        WindowMoveArea { }
+        // La interfaz de siempre. Se oculta al achicarse al círculo.
+        Rectangle {
+            visible: !root.collapsed;
+            width: 100%;
+            height: 100%;
+            border-radius: 14px;
+            background: @linear-gradient(180deg, #202020, #090909);
+            border-width: 1px;
+            border-color: #ffffff18;
 
-        HorizontalLayout {
-            width: parent.width;
-            height: parent.height;
-            spacing: 0;
+            // Toda la ventana se puede arrastrar. Los controles se declaran
+            // después, así que quedan por encima y siguen recibiendo sus clics
+            // con normalidad.
+            WindowMoveArea { }
 
-            // El área central: los tres paneles se apilan en el mismo lugar
-            // y `PanelSlot` deja visible solo el que está activo.
-            Rectangle {
-                horizontal-stretch: 1;
-                clip: true;
+            HorizontalLayout {
+                width: parent.width;
+                height: parent.height;
+                spacing: 0;
 
-                // ── Controles ──
-                PanelSlot {
-                    active: root.active-panel == 0;
+                // El área central: los tres paneles se apilan en el mismo lugar
+                // y `PanelSlot` deja visible solo el que está activo.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    clip: true;
 
-                    VerticalLayout {
-                        padding-left: 18px;
-                        padding-right: 14px;
-                        spacing: 6px;
-                        alignment: center;
+                    // ── Controles ──
+                    PanelSlot {
+                        active: root.active-panel == 0;
 
-                        HorizontalLayout {
-                            spacing: 12px;
-                            cross-axis-alignment: center;
+                        VerticalLayout {
+                            padding-left: 18px;
+                            padding-right: 14px;
+                            spacing: 6px;
+                            alignment: center;
 
-                            // Título y artista: la mitad izquierda de la fila.
-                            VerticalLayout {
-                                width: 50%;
-                                horizontal-stretch: 1;
-                                alignment: center;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                cross-axis-alignment: center;
 
-                                Text {
-                                    text: root.track-title;
-                                    color: root.has-session ? #f4f4f8 : #8d8d99;
-                                    font-size: 14px;
-                                    overflow: elide;
+                                // Título y artista: la mitad izquierda de la fila.
+                                VerticalLayout {
+                                    width: 50%;
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+
+                                    Text {
+                                        text: root.track-title;
+                                        color: root.has-session ? #f4f4f8 : #8d8d99;
+                                        font-size: 14px;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: root.track-artist;
+                                        color: #9a9aa6;
+                                        font-size: 11px;
+                                        overflow: elide;
+                                    }
+
+                                    // Selector de sesión: solo aparece cuando hay
+                                    // más de una.
+                                    if root.session-count > 1: HorizontalLayout {
+                                        horizontal-stretch: 0;
+                                        spacing: 5px;
+                                        padding-top: 5px;
+
+                                        for session in root.sessions: SessionChip {
+                                            label: session.label;
+                                            selected: session.id == root.session-id;
+                                            clicked => { root.select-session(session.id); }
+                                        }
+                                    }
                                 }
 
-                                Text {
-                                    text: root.track-artist;
-                                    color: #9a9aa6;
-                                    font-size: 11px;
-                                    overflow: elide;
-                                }
+                                // Los controles, pegados al borde derecho.
+                                HorizontalLayout {
+                                    alignment: end;
+                                    spacing: 4px;
 
-                                // Selector de sesión: solo aparece cuando hay
-                                // más de una.
-                                if root.session-count > 1: HorizontalLayout {
-                                    horizontal-stretch: 0;
-                                    spacing: 5px;
-                                    padding-top: 5px;
+                                    IconButton {
+                                        icon: @image-url("../assets/icons/replay_10.svg");
+                                        active: root.has-session && root.can-seek;
+                                        clicked => { root.seek-backward(); }
+                                    }
 
-                                    for session in root.sessions: SessionChip {
-                                        label: session.label;
-                                        selected: session.id == root.session-id;
-                                        clicked => { root.select-session(session.id); }
+                                    IconButton {
+                                        icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
+                                        active: root.has-session && root.can-toggle;
+                                        clicked => { root.toggle-play-pause(); }
+                                    }
+
+                                    IconButton {
+                                        icon: @image-url("../assets/icons/forward_10.svg");
+                                        active: root.has-session && root.can-seek;
+                                        clicked => { root.seek-forward(); }
                                     }
                                 }
                             }
 
-                            // Los controles, pegados al borde derecho.
-                            HorizontalLayout {
-                                alignment: end;
-                                spacing: 4px;
-
-                                IconButton {
-                                    icon: @image-url("../assets/icons/replay_10.svg");
-                                    active: root.has-session && root.can-seek;
-                                    clicked => { root.seek-backward(); }
-                                }
-
-                                IconButton {
-                                    icon: root.playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play_arrow.svg");
-                                    active: root.has-session && root.can-toggle;
-                                    clicked => { root.toggle-play-pause(); }
-                                }
-
-                                IconButton {
-                                    icon: @image-url("../assets/icons/forward_10.svg");
-                                    active: root.has-session && root.can-seek;
-                                    clicked => { root.seek-forward(); }
-                                }
-                            }
-                        }
-
-                        // Línea de progreso: un slider para buscar posición, a
-                        // lo ancho completo del panel.
-                        Slider {
-                            width: 100%;
-                            height: 22px;
-                            minimum: 0.0;
-                            maximum: root.duration-secs * 1.0;
-                            value: root.position-secs * 1.0;
-                            enabled: root.has-session && root.can-seek;
-                            released => { root.seek-to(self.value); }
-                        }
-                    }
-                }
-
-                // ── Conexión: vista de unión ──
-                //
-                // Cuando estoy solo: tu código arriba, la entrada para unirte a
-                // la sala del otro abajo, separadas por una línea sutil en vez
-                // de la "o" que ocupaba una fila entera.
-                PanelSlot {
-                    active: root.active-panel == 1 && root.room-count <= 1;
-                    VerticalLayout {
-                        padding-left: 12px;
-                        padding-right: 12px;
-                        padding-top: 14px;
-                        padding-bottom: 14px;
-                        spacing: 10px;
-                        alignment: center;
-
-                        // Tu código (con su punto de estado y copiar).
-                        CodeCopyRow {
-                            horizontal-stretch: 1;
-                            text: root.room-code;
-                            read-only: true;
-                            row-height: 30px;
-                            font-size: 12px;
-                            font-weight: 500;
-                            letter-spacing: 0.5px;
-                            show-dot: true;
-                            can-send: root.can-send;
-                        }
-
-                        // Divisor sutil entre "tu código" y "unirte".
-                        Rectangle {
-                            width: 100%;
-                            height: 1px;
-                            background: #ffffff14;
-                        }
-
-                        // Unirse a otra sala: se escribe el código y se
-                        // conecta, con el botón o con Enter.
-                        HorizontalLayout {
-                            spacing: 6px;
-                            cross-axis-alignment: center;
-
-                            CodeField {
-                                horizontal-stretch: 1;
-                                height: 24px;
-                                text <=> root.peer-room;
-                                placeholder: "código";
-                                font-size: 12px;
-                                accepted => { root.connect(root.peer-room); }
-                            }
-
-                            IconButton {
-                                icon: @image-url("../assets/icons/link.svg");
-                                icon-size: 14px;
-                                tint: #dcdcff;
-                                width: 24px;
-                                height: 24px;
-                                primary: true;
-                                border-radius: 5px;
-                                clicked => { root.connect(root.peer-room); }
+                            // Línea de progreso: un slider para buscar posición, a
+                            // lo ancho completo del panel.
+                            Slider {
+                                width: 100%;
+                                height: 22px;
+                                minimum: 0.0;
+                                maximum: root.duration-secs * 1.0;
+                                value: root.position-secs * 1.0;
+                                enabled: root.has-session && root.can-seek;
+                                released => { root.seek-to(self.value); }
                             }
                         }
                     }
-                }
 
-                // ── Conexión: vista conectada ──
-                //
-                // Con otra persona en la sala: la misma fila de la sala, el
-                // rol con el botón de desconectar al costado y las órbitas,
-                // una por persona.
-                PanelSlot {
-                    active: root.active-panel == 1 && root.room-count > 1;
+                    // ── Conexión: vista de unión ──
+                    //
+                    // Cuando estoy solo: tu código arriba, la entrada para unirte a
+                    // la sala del otro abajo, separadas por una línea sutil en vez
+                    // de la "o" que ocupaba una fila entera.
+                    PanelSlot {
+                        active: root.active-panel == 1 && root.room-count <= 1;
+                        VerticalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 14px;
+                            padding-bottom: 14px;
+                            spacing: 10px;
+                            alignment: center;
 
-                    VerticalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        padding-top: 8px;
-                        padding-bottom: 8px;
-                        spacing: 4px;
-                        alignment: center;
-
-                        HorizontalLayout {
-                            spacing: 6px;
-                            cross-axis-alignment: center;
-                            padding-left: 2px;
-
+                            // Tu código (con su punto de estado y copiar).
                             CodeCopyRow {
                                 horizontal-stretch: 1;
                                 text: root.room-code;
                                 read-only: true;
-                                row-height: 24px;
+                                row-height: 30px;
                                 font-size: 12px;
                                 font-weight: 500;
                                 letter-spacing: 0.5px;
                                 show-dot: true;
                                 can-send: root.can-send;
                             }
-                        }
 
-                        // Una órbita por persona de la sala, incluido uno mismo.
-                        // `animation-tick` es el reloj de animación de Slint,
-                        // no un timer que consulte nada: la órbita gira con el
-                        // cuadro. Una vuelta cada 8 s para que se mueva muy
-                        // suave, sin temblor.
-                        HorizontalLayout {
-                            alignment: center;
-                            spacing: 0;
+                            // Divisor sutil entre "tu código" y "unirte".
+                            Rectangle {
+                                width: 100%;
+                                height: 1px;
+                                background: #ffffff14;
+                            }
 
-                            orbit := Rectangle {
-                                width: 40px;
-                                height: 40px;
-                                property <length> radius: 13px;
-                                property <angle> spin: 1turn * (animation-tick() / 12s);
+                            // Unirse a otra sala: se escribe el código y se
+                            // conecta, con el botón o con Enter.
+                            HorizontalLayout {
+                                spacing: 6px;
+                                cross-axis-alignment: center;
 
-                                for i in root.room-count: Rectangle {
-                                    property <angle> phase: orbit.spin + 1turn * (i * 1.0 / root.room-count);
-                                    width: 12px;
-                                    height: 12px;
-                                    border-radius: 6px;
-                                    background: #7c7cff33;
-                                    opacity: 1;
-                                    x: (parent.width - self.width) / 2 + orbit.radius * Math.cos(phase);
-                                    y: (parent.height - self.height) / 2 + orbit.radius * Math.sin(phase);
+                                CodeField {
+                                    horizontal-stretch: 1;
+                                    height: 24px;
+                                    text <=> root.peer-room;
+                                    placeholder: "código";
+                                    font-size: 12px;
+                                    accepted => { root.connect(root.peer-room); }
+                                }
 
-                                    Rectangle {
-                                        width: 6px;
-                                        height: 6px;
-                                        border-radius: 3px;
-                                        x: (parent.width - self.width) / 2;
-                                        y: (parent.height - self.height) / 2;
-                                        background: #a9a9ff;
-                                    }
+                                IconButton {
+                                    icon: @image-url("../assets/icons/link.svg");
+                                    icon-size: 14px;
+                                    tint: #dcdcff;
+                                    width: 24px;
+                                    height: 24px;
+                                    primary: true;
+                                    border-radius: 5px;
+                                    clicked => { root.connect(root.peer-room); }
                                 }
                             }
                         }
+                    }
 
-                        // Quién sos en la sala, con el botón de desconectar
-                        // justo debajo de las órbitas.
-                        HorizontalLayout {
+                    // ── Conexión: vista conectada ──
+                    //
+                    // Con otra persona en la sala: la misma fila de la sala, el
+                    // rol con el botón de desconectar al costado y las órbitas,
+                    // una por persona.
+                    PanelSlot {
+                        active: root.active-panel == 1 && root.room-count > 1;
+
+                        VerticalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 4px;
                             alignment: center;
-                            spacing: 8px;
-                            cross-axis-alignment: center;
 
-                            Text {
-                                text: root.role-text;
-                                color: #8d8d99;
-                                font-size: 9px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                cross-axis-alignment: center;
+                                padding-left: 2px;
+
+                                CodeCopyRow {
+                                    horizontal-stretch: 1;
+                                    text: root.room-code;
+                                    read-only: true;
+                                    row-height: 24px;
+                                    font-size: 12px;
+                                    font-weight: 500;
+                                    letter-spacing: 0.5px;
+                                    show-dot: true;
+                                    can-send: root.can-send;
+                                }
                             }
 
-                            IconButton {
-                                icon: @image-url("../assets/icons/logout.svg");
-                                icon-size: 12px;
-                                width: 20px;
-                                height: 20px;
-                                flat: true;
-                                border-radius: 5px;
-                                clicked => { root.disconnect(); }
+                            // Una órbita por persona de la sala, incluido uno mismo.
+                            // `animation-tick` es el reloj de animación de Slint,
+                            // no un timer que consulte nada: la órbita gira con el
+                            // cuadro. Una vuelta cada 8 s para que se mueva muy
+                            // suave, sin temblor.
+                            HorizontalLayout {
+                                alignment: center;
+                                spacing: 0;
+
+                                orbit := Rectangle {
+                                    width: 40px;
+                                    height: 40px;
+                                    property <length> radius: 13px;
+                                    property <angle> spin: 1turn * (animation-tick() / 12s);
+
+                                    for i in root.room-count: Rectangle {
+                                        property <angle> phase: orbit.spin + 1turn * (i * 1.0 / root.room-count);
+                                        width: 12px;
+                                        height: 12px;
+                                        border-radius: 6px;
+                                        background: #7c7cff33;
+                                        opacity: 1;
+                                        x: (parent.width - self.width) / 2 + orbit.radius * Math.cos(phase);
+                                        y: (parent.height - self.height) / 2 + orbit.radius * Math.sin(phase);
+
+                                        Rectangle {
+                                            width: 6px;
+                                            height: 6px;
+                                            border-radius: 3px;
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            background: #a9a9ff;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Quién sos en la sala, con el botón de desconectar
+                            // justo debajo de las órbitas.
+                            HorizontalLayout {
+                                alignment: center;
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+
+                                Text {
+                                    text: root.role-text;
+                                    color: #8d8d99;
+                                    font-size: 9px;
+                                }
+
+                                IconButton {
+                                    icon: @image-url("../assets/icons/logout.svg");
+                                    icon-size: 12px;
+                                    width: 20px;
+                                    height: 20px;
+                                    flat: true;
+                                    border-radius: 5px;
+                                    clicked => { root.disconnect(); }
+                                }
                             }
                         }
                     }
-                }
 
-                // ── Configuración (reservado) ──
-                PanelSlot {
-                    active: root.active-panel == 2;
-                }
-            }
-
-            // La línea que separa el panel del menú.
-            Rectangle {
-                width: 1px;
-                background: #ffffff14;
-            }
-
-            // El menú lateral: tres botones de ícono, apilados y del mismo
-            // tamaño.
-            //
-            // El ancho es el de un botón (30) más su relleno: 42. Con el
-            // ancho que tenía la columna, los botones quedaban pegados a la
-            // izquierda y sobraba aire a la derecha.
-            Rectangle {
-                width: 42px;
-
-                // Tres botones de 30 px: con 112 px de alto, tres de 34 más
-                // la separación no entran.
-                VerticalLayout {
-                    width: 100%;
-                    height: 100%;
-                    padding: 6px;
-                    spacing: 4px;
-                    alignment: center;
-
-                    IconButton {
-                        icon: @image-url("../assets/icons/link.svg");
-                        icon-size: 17px;
-                        width: 30px;
-                        height: 30px;
-                        selected: root.active-panel == 1;
-                        tint: root.active-panel == 1 ? #a9a9ff : #f2f2f6;
-                        clicked => { root.active-panel = 1; }
-                    }
-
-                    IconButton {
-                        icon: @image-url("../assets/icons/tune.svg");
-                        icon-size: 17px;
-                        width: 30px;
-                        height: 30px;
-                        selected: root.active-panel == 0;
-                        tint: root.active-panel == 0 ? #a9a9ff : #f2f2f6;
-                        clicked => { root.active-panel = 0; }
-                    }
-
-                    IconButton {
-                        icon: @image-url("../assets/icons/settings.svg");
-                        icon-size: 17px;
-                        width: 30px;
-                        height: 30px;
-                        selected: root.active-panel == 2;
-                        tint: root.active-panel == 2 ? #a9a9ff : #f2f2f6;
-                        clicked => { root.active-panel = 2; }
+                    // ── Configuración (reservado) ──
+                    PanelSlot {
+                        active: root.active-panel == 2;
                     }
                 }
+
+                // La línea que separa el panel del menú.
+                Rectangle {
+                    width: 1px;
+                    background: #ffffff14;
+                }
+
+                // El menú lateral: tres botones de ícono, apilados y del mismo
+                // tamaño.
+                //
+                // El ancho es el de un botón (30) más su relleno: 42. Con el
+                // ancho que tenía la columna, los botones quedaban pegados a la
+                // izquierda y sobraba aire a la derecha.
+                Rectangle {
+                    width: 42px;
+
+                    // Tres botones de 30 px: con 112 px de alto, tres de 34 más
+                    // la separación no entran.
+                    VerticalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding: 6px;
+                        spacing: 4px;
+                        alignment: center;
+
+                        IconButton {
+                            icon: @image-url("../assets/icons/link.svg");
+                            icon-size: 17px;
+                            width: 30px;
+                            height: 30px;
+                            selected: root.active-panel == 1;
+                            tint: root.active-panel == 1 ? #a9a9ff : #f2f2f6;
+                            clicked => { root.active-panel = 1; }
+                        }
+
+                        IconButton {
+                            icon: @image-url("../assets/icons/tune.svg");
+                            icon-size: 17px;
+                            width: 30px;
+                            height: 30px;
+                            selected: root.active-panel == 0;
+                            tint: root.active-panel == 0 ? #a9a9ff : #f2f2f6;
+                            clicked => { root.active-panel = 0; }
+                        }
+
+                        IconButton {
+                            icon: @image-url("../assets/icons/settings.svg");
+                            icon-size: 17px;
+                            width: 30px;
+                            height: 30px;
+                            selected: root.active-panel == 2;
+                            tint: root.active-panel == 2 ? #a9a9ff : #f2f2f6;
+                            clicked => { root.active-panel = 2; }
+                        }
+                    }
+                }
             }
+        }
+
+        // El círculo: la misma ventana, sin la interfaz.
+        //
+        // El fondo translúcido deja ver lo que hay detrás y la opacidad
+        // atendúa también el borde y el ícono, así el círculo se nota sin
+        // tapar la reproducción.
+        Rectangle {
+            visible: root.collapsed;
+            width: 100%;
+            height: 100%;
+            border-radius: 22px;
+            opacity: 0.35;
+            background: #101014cc;
+            border-width: 1px;
+            border-color: #ffffff22;
+
+            Image {
+                source: @image-url("../assets/icons/link.svg");
+                colorize: #a9a9ff;
+                width: 20px;
+                height: 20px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+    }
+
+    changed pointer-inside => {
+        if root.pointer-inside {
+            root.pointer-entered();
+        } else {
+            root.pointer-left();
         }
     }
 

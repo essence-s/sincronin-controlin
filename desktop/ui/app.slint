@@ -33,8 +33,9 @@ component CodeField inherits Rectangle {
         input.clear-selection();
     }
 
-    height: 30px;
+    in property <length> field-height: 30px;
     border-radius: 6px;
+    height: root.field-height;
     background: root.bare ? #00000000 : #ffffff10;
     border-width: root.bare ? 0px : 1px;
     border-color: input.has-focus ? #7c7cff : #ffffff26;
@@ -120,6 +121,52 @@ component IconButton inherits Rectangle {
         height: root.icon-size;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+}
+
+// Fila: punto de estado + código + botón copiar. Se reusa en ambas vistas de
+// Conexión (unión y conectados).
+component CodeCopyRow inherits HorizontalLayout {
+    in-out property <string> text;
+    in property <bool> read-only: true;
+    in property <string> placeholder: "";
+    in property <length> row-height: 30px;
+    in property <length> font-size: 13px;
+    in property <int> font-weight: 500;
+    in property <length> letter-spacing: 0.5px;
+    in property <bool> show-dot: true;
+    in property <bool> can-send: false;
+    callback copied();
+
+    spacing: 6px;
+    cross-axis-alignment: center;
+
+    if root.show-dot: Rectangle {
+        width: 5px;
+        height: 5px;
+        border-radius: 2.5px;
+        background: root.can-send ? #6ee7a8 : #5c5c66;
+    }
+
+    code := CodeField {
+        horizontal-stretch: 1;
+        field-height: root.row-height;
+        text <=> root.text;
+        read-only: root.read-only;
+        bare: true;
+        placeholder: root.placeholder;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        letter-spacing: root.letter-spacing;
+    }
+
+    IconButton {
+        icon: @image-url("../assets/icons/content_copy.svg");
+        icon-size: 13px;
+        width: 22px;
+        height: 22px;
+        flat: true;
+        clicked => { code.copy-text(); root.copied(); }
     }
 }
 
@@ -405,74 +452,48 @@ export component AppWindow inherits Window {
 
                 // ── Conexión: vista de unión ──
                 //
-                // Cuando estoy solo: el contenido mide 112×112 px (155 menos
-                // los 42 del menú y el 1 del separador), así que el código, la
-                // "o" y el campo del otro equipo van en tres filas apretadas.
+                // Cuando estoy solo: tu código arriba, la entrada para unirte a
+                // la sala del otro abajo, separadas por una línea sutil en vez
+                // de la "o" que ocupaba una fila entera.
                 PanelSlot {
                     active: root.active-panel == 1 && root.room-count <= 1;
                     VerticalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
-                        padding-top: 8px;
-                        padding-bottom: 8px;
-                        spacing: 8px;
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        spacing: 10px;
                         alignment: center;
 
-                        // El código propio con su punto de estado y el botón
-                        // de copiar al lado.
-                        HorizontalLayout {
-                            spacing: 4px;
-                            cross-axis-alignment: center;
-
-                            // Un punto: verde si el canal está abierto. Sin
-                            // texto, es lo único que avisa que la conexión
-                            // prendió hasta que exista la vista conectada.
-                            Rectangle {
-                                width: 6px;
-                                height: 6px;
-                                border-radius: 3px;
-                                background: root.can-send ? #6ee7a8 : #5c5c66;
-                            }
-
-                            code := CodeField {
-                                horizontal-stretch: 1;
-                                height: 30px;
-                                text: root.room-code;
-                                read-only: true;
-                                bare: true;
-                                font-size: 13px;
-                                font-weight: 500;
-                                letter-spacing: 0.5px;
-                            }
-
-                            IconButton {
-                                icon: @image-url("../assets/icons/content_copy.svg");
-                                icon-size: 13px;
-                                width: 22px;
-                                height: 22px;
-                                flat: true;
-                                clicked => { code.copy-text(); }
-                            }
+                        // Tu código (con su punto de estado y copiar).
+                        CodeCopyRow {
+                            horizontal-stretch: 1;
+                            text: root.room-code;
+                            read-only: true;
+                            row-height: 30px;
+                            font-size: 12px;
+                            font-weight: 500;
+                            letter-spacing: 0.5px;
+                            show-dot: true;
+                            can-send: root.can-send;
                         }
 
-                        // La "o" que une los dos códigos: el de la sala en la
-                        // que estoy y el de la sala a la que quiero entrar.
-                        Text {
-                            text: "o";
-                            horizontal-alignment: center;
-                            color: #6f6f7c;
-                            font-size: 10px;
+                        // Divisor sutil entre "tu código" y "unirte".
+                        Rectangle {
+                            width: 100%;
+                            height: 1px;
+                            background: #ffffff14;
                         }
 
                         // Unirse a otra sala: se escribe el código y se
                         // conecta, con el botón o con Enter.
                         HorizontalLayout {
-                            spacing: 5px;
+                            spacing: 6px;
                             cross-axis-alignment: center;
 
                             CodeField {
                                 horizontal-stretch: 1;
-                                height: 26px;
+                                height: 28px;
                                 text <=> root.peer-room;
                                 placeholder: "código";
                                 font-size: 12px;
@@ -484,7 +505,7 @@ export component AppWindow inherits Window {
                                 icon-size: 14px;
                                 tint: #dcdcff;
                                 width: 24px;
-                                height: 26px;
+                                height: 28px;
                                 primary: true;
                                 clicked => { root.connect(root.peer-room); }
                             }
@@ -495,78 +516,61 @@ export component AppWindow inherits Window {
                 // ── Conexión: vista conectada ──
                 //
                 // Con otra persona en la sala: la misma fila de la sala, el
-                // rol en una línea y las órbitas, una por persona.
-                // El botón de desconectar va al costado de las órbitas: en la
-                // fila del código no entra.
+                // rol con el botón de desconectar al costado y las órbitas,
+                // una por persona.
                 PanelSlot {
                     active: root.active-panel == 1 && root.room-count > 1;
 
                     VerticalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
+                        padding-left: 10px;
+                        padding-right: 10px;
                         padding-top: 8px;
                         padding-bottom: 8px;
                         spacing: 4px;
                         alignment: center;
 
                         HorizontalLayout {
-                            spacing: 4px;
+                            spacing: 6px;
                             cross-axis-alignment: center;
+                            padding-left: 2px;
 
-                            copy_source := CodeField {
+                            CodeCopyRow {
                                 horizontal-stretch: 1;
-                                height: 24px;
                                 text: root.room-code;
                                 read-only: true;
-                                bare: true;
-                                font-size: 13px;
+                                row-height: 24px;
+                                font-size: 12px;
                                 font-weight: 500;
                                 letter-spacing: 0.5px;
-                            }
-
-                            IconButton {
-                                icon: @image-url("../assets/icons/content_copy.svg");
-                                icon-size: 13px;
-                                width: 22px;
-                                height: 22px;
-                                flat: true;
-                                clicked => { copy_source.copy-text(); }
+                                show-dot: true;
+                                can-send: root.can-send;
                             }
                         }
 
-                        // Quién sos en la sala. La vista ya dice que la
-                        // conexión está abierta, así que solo va el rol.
-                        Text {
-                            text: root.role-text;
-                            color: #8d8d99;
-                            font-size: 9px;
-                            horizontal-alignment: center;
-                        }
-
+                        // Una órbita por persona de la sala, incluido uno mismo.
+                        // `animation-tick` es el reloj de animación de Slint,
+                        // no un timer que consulte nada: la órbita gira con el
+                        // cuadro. Una vuelta cada 8 s para que se mueva muy
+                        // suave, sin temblor.
                         HorizontalLayout {
                             alignment: center;
-                            spacing: 4px;
-                            cross-axis-alignment: center;
+                            spacing: 0;
 
-                            // Una órbita por persona de la sala, incluido uno mismo.
-                            // `animation-tick` es el reloj de animación de Slint,
-                            // no un timer que consulte nada: la órbita gira con el
-                            // cuadro.
                             orbit := Rectangle {
-                                width: 48px;
-                                height: 48px;
-                                property <length> radius: 16px;
-                                property <angle> spin: 1turn * (animation-tick() / 1s);
+                                width: 40px;
+                                height: 40px;
+                                property <length> radius: 13px;
+                                property <angle> spin: 1turn * (animation-tick() / 12s);
 
                                 for i in root.room-count: Rectangle {
                                     property <angle> phase: orbit.spin + 1turn * (i * 1.0 / root.room-count);
-                                    width: 14px;
-                                    height: 14px;
-                                    border-radius: 7px;
-                                    background: #7c7cff22;
+                                    width: 12px;
+                                    height: 12px;
+                                    border-radius: 6px;
+                                    background: #7c7cff33;
+                                    opacity: 1;
                                     x: (parent.width - self.width) / 2 + orbit.radius * Math.cos(phase);
                                     y: (parent.height - self.height) / 2 + orbit.radius * Math.sin(phase);
-                                    opacity: 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(phase));
 
                                     Rectangle {
                                         width: 6px;
@@ -578,12 +582,26 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
+
+                        // Quién sos en la sala, con el botón de desconectar
+                        // justo debajo de las órbitas.
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+                            cross-axis-alignment: center;
+
+                            Text {
+                                text: root.role-text;
+                                color: #8d8d99;
+                                font-size: 9px;
+                            }
 
                             IconButton {
                                 icon: @image-url("../assets/icons/logout.svg");
-                                icon-size: 13px;
-                                width: 24px;
-                                height: 24px;
+                                icon-size: 12px;
+                                width: 20px;
+                                height: 20px;
                                 flat: true;
                                 clicked => { root.disconnect(); }
                             }

@@ -8,17 +8,22 @@
 //! [`AppPort`], para que `app` solo componga las piezas.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::domain::media::{PlaybackState, Snapshot};
 use crate::domain::messages::RemoteState;
+use crate::domain::notice::Notice;
 use crate::domain::room::Role;
 use crate::ports::{AppPort, UiPort};
 use crate::{AppWindow, MediaSession};
 
 /// Cuántas líneas guarda el registro de la ventana de red.
 const MAX_LOG_LINES: usize = 40;
+
+/// Cuánto dura un aviso en el tamaño intermedio.
+const NOTICE_DURATION: Duration = Duration::from_secs(2);
 
 /// El panel de Conexión en el menú lateral.
 ///
@@ -136,6 +141,31 @@ impl UiPort for SlintAdapter {
         // llegara un número absurdo.
         let count = i32::try_from(count).unwrap_or(i32::MAX);
         self.run(move |ui| ui.set_room_count(count));
+    }
+
+    fn show_notice(&self, notice: Notice) {
+        let text: SharedString = notice.label().into();
+        self.run(move |ui| {
+            // Con la interfaz abierta el estado ya se ve: el aviso es para el
+            // modo chico.
+            if !ui.get_collapsed() {
+                return;
+            }
+
+            ui.set_notice_text(text.clone());
+
+            // El aviso se va solo. Es de un solo tiro y no consulta nada.
+            let weak = ui.as_weak();
+            let shown = text.clone();
+            slint::Timer::single_shot(NOTICE_DURATION, move || {
+                if let Some(ui) = weak.upgrade() {
+                    // Si otro aviso lo reemplazó, no se borra el nuevo.
+                    if ui.get_notice_text() == shown {
+                        ui.set_notice_text(SharedString::default());
+                    }
+                }
+            });
+        });
     }
 
     fn append_log(&self, line: String) {

@@ -9,5 +9,6 @@ pub mod interpolation;
 pub mod media;
 pub mod messages;
 pub mod net;
+pub mod notice;
 pub mod room;
 pub mod window;

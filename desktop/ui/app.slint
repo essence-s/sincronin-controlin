@@ -284,10 +284,13 @@ export component AppWindow inherits Window {
     // La ventana es compacta por defecto. Controles es el único panel que
     // necesita el ancho grande; Conexión y Configuración comparten los
     // 155 px (112 de contenido + 42 de menú + 1 de separador).
-    // El círculo del modo discreto: la ventana entera, achicada y sin la
-    // interfaz, para no tapar lo que se está viendo a pantalla completa.
-    width: root.collapsed ? 44px : (root.active-panel == 0 ? 420px : 155px);
-    height: root.collapsed ? 44px : 112px;
+    // Tres tamaños: el intermedio (solo para un aviso), el círculo del modo
+    // discreto y el default, que depende del panel abierto. El intermedio es
+    // más grande que el círculo y más chico que cualquiera de los paneles.
+    width: root.notice-text != ""
+        ? 150px
+        : (root.collapsed ? 44px : (root.active-panel == 0 ? 420px : 155px));
+    height: root.notice-text != "" ? 88px : (root.collapsed ? 44px : 112px);
 
     // El tamaño que quiere la ventana. En Windows lo usa el backend para
     // reanclar la ventana abajo al centro cuando cambia el ancho.
@@ -354,14 +357,18 @@ export component AppWindow inherits Window {
     property <bool> pointer-inside: sensor.has-hover;
     // La ventana está achicada al círculo del modo discreto.
     in-out property <bool> collapsed: false;
+    // El aviso que se está mostrando en el tamaño intermedio. Vacío es "no
+    // hay aviso" y la ventana vuelve al círculo o al default.
+    in-out property <string> notice-text: "";
 
     sensor := TouchArea {
         width: 100%;
         height: 100%;
 
-        // La interfaz de siempre. Se oculta al achicarse al círculo.
+        // La interfaz de siempre. Se oculta al achicarse al círculo y
+        // mientras hay un aviso.
         Rectangle {
-            visible: !root.collapsed;
+            visible: !root.collapsed && root.notice-text == "";
             width: 100%;
             height: 100%;
             border-radius: 14px;
@@ -704,7 +711,7 @@ export component AppWindow inherits Window {
         // atendúa también el borde y el ícono, así el círculo se nota sin
         // tapar la reproducción.
         Rectangle {
-            visible: root.collapsed;
+            visible: root.collapsed && root.notice-text == "";
             width: 100%;
             height: 100%;
             border-radius: 22px;
@@ -720,6 +727,29 @@ export component AppWindow inherits Window {
                 height: 20px;
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
+            }
+        }
+
+        // El tamaño intermedio: solo el aviso, sin controles ni título.
+        Rectangle {
+            visible: root.notice-text != "";
+            width: 100%;
+            height: 100%;
+            border-radius: 14px;
+            background: @linear-gradient(180deg, #202020, #090909);
+            border-width: 1px;
+            border-color: #ffffff18;
+
+            Text {
+                text: root.notice-text;
+                color: #f4f4f8;
+                font-size: 13px;
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
             }
         }
     }

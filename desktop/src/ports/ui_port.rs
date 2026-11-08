@@ -6,6 +6,7 @@
 
 use crate::domain::media::Snapshot;
 use crate::domain::messages::RemoteState;
+use crate::domain::notice::Notice;
 use crate::domain::room::Role;
 
 /// Puerto de la interfaz de usuario.
@@ -43,6 +44,12 @@ pub trait UiPort: Send + Sync + 'static {
     /// La vista de Conexión elige entre la de unión y la conectada con este
     /// número: uno o cero es "solo", más de uno es "conectado".
     fn set_room_count(&self, count: usize);
+
+    /// Un aviso breve para el tamaño intermedio de la ventana.
+    ///
+    /// La UI lo muestra solo si la ventana está achicada: con la interfaz
+    /// abierta el estado ya se ve.
+    fn show_notice(&self, notice: Notice);
 
     /// Agrega una línea al registro del panel de red.
     fn append_log(&self, line: String);

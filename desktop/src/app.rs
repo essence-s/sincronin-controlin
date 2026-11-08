@@ -99,6 +99,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
             // tamaño default es aplicarla, no un caso aparte.
             if let Some(ui) = weak.upgrade() {
                 ui.set_collapsed(false);
+                // El aviso del tamaño intermedio se descarta al abrir la
+                // interfaz: ya se ve el estado.
+                ui.set_notice_text("".into());
             }
         });
     }

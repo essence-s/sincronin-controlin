@@ -18,6 +18,7 @@ use crate::domain::messages::{
     Incoming, RemoteState, command_message, route_message, state_message,
 };
 use crate::domain::net::{NetEvent, NetState};
+use crate::domain::notice::Notice;
 use crate::domain::room::Role;
 use crate::ports::{MediaPort, NetPort, UiPort};
 
@@ -28,6 +29,9 @@ pub struct StateService<M: MediaPort, N: NetPort> {
     ui: Arc<dyn UiPort>,
     role: Option<Role>,
     net_state: NetState,
+    /// La última cantidad que llegó de la sala: sirve para avisar solo
+    /// cuando entra alguien, no cuando se va.
+    room_count: usize,
     last_snapshot: Snapshot,
     /// Mientras el controlador muestra el estado del controlado, las fotos
     /// de su propio reproductor no pisan la UI.
@@ -46,6 +50,7 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
             ui,
             role: None,
             net_state: NetState::Desconectado,
+            room_count: 0,
             last_snapshot: Snapshot::no_session(),
             remote_active: false,
             publisher: StatePublisher::new(),
@@ -65,7 +70,15 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
         match event {
             NetEvent::State(state) => self.on_net_state(state, now),
             NetEvent::AssignedRole(role) => self.on_role(role, now),
-            NetEvent::RoomCount(count) => self.ui.set_room_count(count),
+            NetEvent::RoomCount(count) => {
+                // Uno es el arranque o el propio equipo: solo se avisa
+                // cuando aparece otro.
+                if count >= 2 && count > self.room_count {
+                    self.ui.show_notice(Notice::PeerJoined);
+                }
+                self.room_count = count;
+                self.ui.set_room_count(count);
+            }
             NetEvent::Notice(text) => self.ui.append_log(format!("· {text}")),
             NetEvent::Message(text) => self.on_message(text, now),
             NetEvent::ControlledMoved { room } => {
@@ -153,6 +166,7 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
             self.publisher = StatePublisher::new();
             self.pending = None;
             // Sin conexión no hay sala: la vista vuelve a la de unión.
+            self.room_count = 0;
             self.ui.set_room_count(0);
 
             // Si se cierra el canal, el estado remoto deja de ser válido:
@@ -193,6 +207,7 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
                 // El comando remoto solo lo aplica el controlado, una vez.
                 if self.role == Some(Role::Controlado) {
                     self.pending = Some(PendingCommand::from_command(&command, now));
+                    self.ui.show_notice(Notice::RemoteCommand(command.clone()));
                     self.media.send_command(command);
                 }
             }
@@ -368,6 +383,7 @@ mod tests {
         peer_rooms: Mutex<Vec<String>>,
         can_send: Mutex<Vec<bool>>,
         room_counts: Mutex<Vec<usize>>,
+        notices: Mutex<Vec<Notice>>,
         log: Mutex<Vec<String>>,
         open_panel: Mutex<usize>,
     }
@@ -427,6 +443,13 @@ mod tests {
                 .lock()
                 .expect("la UI no está poisoned")
                 .push(count);
+        }
+
+        fn show_notice(&self, notice: Notice) {
+            self.notices
+                .lock()
+                .expect("la UI no está poisoned")
+                .push(notice);
         }
 
         fn append_log(&self, line: String) {
@@ -920,5 +943,49 @@ mod tests {
             ..playing(0)
         };
         assert!(publisher.should_publish(&changed, start + Duration::from_millis(100)));
+    }
+
+    /// Un comando remoto se anuncia en el tamaño intermedio.
+    #[test]
+    fn a_remote_command_shows_the_notice() {
+        let mut h = harness();
+        let now = Instant::now();
+
+        h.service
+            .on_net_event(NetEvent::AssignedRole(Role::Controlado), now);
+        h.service
+            .on_net_event(NetEvent::Message("pause".to_string()), now);
+
+        assert_eq!(
+            h.ui.notices
+                .lock()
+                .expect("la UI no está poisoned")
+                .as_slice(),
+            [Notice::RemoteCommand(Command::Pause)]
+        );
+    }
+
+    /// Entrar solo a la sala no es un aviso; que entre otro, sí.
+    #[test]
+    fn a_new_peer_shows_the_connection_notice() {
+        let mut h = harness();
+        let now = Instant::now();
+
+        h.service.on_net_event(NetEvent::RoomCount(1), now);
+        assert!(
+            h.ui.notices
+                .lock()
+                .expect("la UI no está poisoned")
+                .is_empty()
+        );
+
+        h.service.on_net_event(NetEvent::RoomCount(2), now);
+        assert_eq!(
+            h.ui.notices
+                .lock()
+                .expect("la UI no está poisoned")
+                .as_slice(),
+            [Notice::PeerJoined]
+        );
     }
 }

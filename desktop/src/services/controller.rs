@@ -123,6 +123,7 @@ mod tests {
     use crate::domain::media::Snapshot;
     use crate::domain::messages::RemoteState;
     use crate::domain::net::NetEvent;
+    use crate::domain::notice::Notice;
     use crate::domain::room::Role;
 
     #[derive(Clone, Default)]
@@ -203,6 +204,8 @@ mod tests {
         fn set_can_send(&self, _can: bool) {}
 
         fn set_room_count(&self, _count: usize) {}
+
+        fn show_notice(&self, _notice: Notice) {}
 
         fn append_log(&self, _line: String) {}
 

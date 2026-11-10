@@ -19,7 +19,7 @@ use crate::AppWindow;
 use crate::adapters::media::MediaAdapter;
 use crate::adapters::net::NetAdapter;
 use crate::adapters::ui::slint::SlintAdapter;
-use crate::domain::window::{IDLE_COLLAPSE, WindowIdle, WindowMode};
+use crate::domain::window::{COLLAPSE_SLACK, IDLE_COLLAPSE, WindowIdle, WindowMode};
 use crate::platform;
 use crate::ports::{AppPort, MediaPort, NetPort, UiPort};
 use crate::services::controller::AppController;
@@ -117,6 +117,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // ya, sin esperar a que entre y salga.
     arm_collapse(ui.as_weak(), Rc::clone(&idle));
 
+    // Animar el cambio de tamaño depende de quién sea dueño de la posición:
+    // donde el compositor recoloca la ventana (Wayland), animar acumula un
+    // corrimiento de unos píxeles por ciclo y conviene saltar de golpe.
+    ui.set_animate_resize(platform::animates_resize());
+
     platform::configure(&ui);
 
     ui.run()
@@ -125,7 +130,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// Arma la cuenta de inactividad. Cuando vence, la regla de dominio decide si
 /// la ventana ya puede achicarse; si el mouse volvió a entrar, no hace nada.
 fn arm_collapse(weak: slint::Weak<AppWindow>, idle: Rc<RefCell<WindowIdle>>) {
-    slint::Timer::single_shot(IDLE_COLLAPSE, move || {
+    // El margen evita la carrera del límite: un temporizador que vence justo
+    // en los 2 s puede adelantarse unas décimas y la cuenta todavía no llega.
+    slint::Timer::single_shot(IDLE_COLLAPSE + COLLAPSE_SLACK, move || {
         if idle.borrow().mode(Instant::now()) != WindowMode::Circle {
             return;
         }

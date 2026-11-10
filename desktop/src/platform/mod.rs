@@ -26,16 +26,16 @@ mod windows;
 #[cfg(windows)]
 pub use windows::gsmtc::spawn;
 #[cfg(windows)]
-pub use windows::window::{configure, reposition};
+pub use windows::window::{animates_resize, configure, reposition};
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::mpris::spawn;
 #[cfg(target_os = "linux")]
-pub use linux::window::{configure, reposition};
+pub use linux::window::{animates_resize, configure, reposition};
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod stub;
 #[cfg(not(any(windows, target_os = "linux")))]
-pub use stub::{configure, reposition, spawn};
+pub use stub::{animates_resize, configure, reposition, spawn};

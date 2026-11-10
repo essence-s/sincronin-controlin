@@ -32,6 +32,15 @@ pub fn configure(ui: &AppWindow) {
     attempt(ui.as_weak(), 0);
 }
 
+/// En Windows se puede animar el cambio de tamaño.
+///
+/// La posición no la decide el sistema: [`reposition`] la calcula como una
+/// función pura del tamaño nativo en cada cuadro, así que los pasos
+/// intermedios no dejan error — el último siempre cae exacto en el centro.
+pub fn animates_resize() -> bool {
+    true
+}
+
 fn attempt(weak: slint::Weak<AppWindow>, attempt_n: u32) {
     let Some(ui) = weak.upgrade() else {
         return;
@@ -101,10 +110,15 @@ fn apply_styles(hwnd: HWND) {
 
 /// Reancla la ventana abajo al centro del área de trabajo.
 ///
-/// Se llama al arrancar y cada vez que cambia el ancho (al abrir Controles o
-/// volver a un panel compacto). Usa el tamaño *querido* por la UI y no el
-/// nativo: cuando llega el aviso, la ventana de winit todavía puede tener el
-/// tamaño anterior.
+/// Se llama al arrancar y cada vez que cambia el tamaño (al achicarse al
+/// círculo, al abrir Controles o al mostrar un aviso). Usa el tamaño *real*
+/// de la ventana y no el que pide la animación: el backend redimensiona de
+/// forma asíncrona, así que el valor animado y el nativo se desfasaron un
+/// cuadro durante toda la transición. Centrar con el valor animado dejaba la
+/// posición calculada con un ancho que la ventana todavía no tenía, y cada
+/// ciclo volvía a correr el ancla unos píxeles. Con el tamaño real, la
+/// posición es una función pura del tamaño que se ve: repetir el cálculo es
+/// idempotente y no se acumula ningún error.
 pub fn reposition(ui: &AppWindow) {
     let mut area = RECT::default();
     let ok = unsafe {
@@ -119,13 +133,22 @@ pub fn reposition(ui: &AppWindow) {
         return;
     }
 
-    let scale = ui.window().scale_factor();
-    let width = (ui.get_wanted_width() * scale).round() as i32;
-    let height = (ui.get_wanted_height() * scale).round() as i32;
+    // Tamaño físico real de la ventana: es el que está en pantalla en este
+    // momento y el que va a ver el compositor.
+    let size = ui.window().size();
+    let width = size.width as i32;
+    let height = size.height as i32;
 
     let available = area.right - area.left;
     let x = area.left + (available - width) / 2;
     let y = area.bottom - height - BOTTOM_MARGIN;
+
+    // Durante la animación se llama una vez por cuadro; si la cuenta da la
+    // misma posición, no hay nada que mover.
+    let current = ui.window().position();
+    if current.x == x && current.y == y {
+        return;
+    }
 
     ui.window().set_position(slint::PhysicalPosition::new(x, y));
 }

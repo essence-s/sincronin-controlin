@@ -289,13 +289,28 @@ export component AppWindow inherits Window {
     // más grande que el círculo y más chico que cualquiera de los paneles.
     width: root.notice-text != ""
         ? 150px
-        : (root.collapsed ? 44px : (root.active-panel == 0 ? 420px : 155px));
+        : (root.collapsed ? 44px : (root.active-panel == 0 ? 420px : 156px));
     height: root.notice-text != "" ? 88px : (root.collapsed ? 44px : 112px);
 
-    // El tamaño que quiere la ventana. En Windows lo usa el backend para
-    // reanclar la ventana abajo al centro cuando cambia el ancho.
-    out property <length> wanted-width: root.width;
-    out property <length> wanted-height: root.height;
+    // Todos los tamaños son pares a propósito (44, 88, 112, 150, 156, 420):
+    // así cada cambio de tamaño tiene un delta par, y el centro no se corre.
+    // Ver el comentario de `animate-resize`.
+
+    // Si la ventana anima el cambio de tamaño. Las plataformas donde el
+    // compositor recoloca la ventana al redimensionarla (Wayland) lo apagan:
+    // cada tamaño intermedio se redondea a píxeles enteros y el centro se
+    // corre un poco, así que la transición cuadro a cuadro acumula un
+    // corrimiento. Lo fija `platform` al arrancar.
+    in-out property <bool> animate-resize: false;
+
+    // El tamaño cambia animado: al achicarse al círculo (y al volver) la
+    // ventana se reduce en 200 ms en vez de saltar de golpe. Slint aplica el
+    // ancho y el alto a la ventana nativa en cada cuadro de la animación, así
+    // que el compositor ve un redimensionado continuo.
+    animate width, height {
+        duration: root.animate-resize ? 200ms : 0ms;
+        easing: ease-in-out;
+    }
 
     in-out property <string> track-title: "Esperando al reproductor…";
     in-out property <string> track-artist: "";
@@ -352,9 +367,24 @@ export component AppWindow inherits Window {
     callback pointer-entered();
     callback pointer-left();
 
-    // El mouse está sobre la ventana. Lo publica el sensor; mientras esté
-    // encima, la ventana no se achica.
-    property <bool> pointer-inside: sensor.has-hover;
+    // El mouse está sobre la ventana. Mientras esté encima, la ventana no se
+    // achica.
+    //
+    // No se deriva de `has-hover` a secas. Slint solo actualiza `has-hover`
+    // cuando llega un evento de puntero, y el backend descarta el evento de
+    // salida si hay un botón apretado (se sale arrastrando la ventana o un
+    // control). En ese caso `has-hover` queda en true y no vuelve a bajar: la
+    // ventana no se achicaría nunca más. Los eventos de puntero permiten
+    // corregirlo con la posición real del último evento.
+    in-out property <bool> pointer-inside: false;
+
+    // Si la posición del último evento cae dentro de la ventana.
+    public function pointer-position-inside() -> bool {
+        return sensor.mouse-x >= 0px
+            && sensor.mouse-y >= 0px
+            && sensor.mouse-x < root.width
+            && sensor.mouse-y < root.height;
+    }
     // La ventana está achicada al círculo del modo discreto.
     in-out property <bool> collapsed: false;
     // El aviso que se está mostrando en el tamaño intermedio. Vacío es "no
@@ -364,6 +394,26 @@ export component AppWindow inherits Window {
     sensor := TouchArea {
         width: 100%;
         height: 100%;
+
+        // Entrar mueve la ventana a default y salir arma el colapso. Un
+        // movimiento confirma que el mouse está encima; una cancelación o un
+        // soltar afuera lo desmienten aunque `has-hover` haya quedado pegado.
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move || event.kind == PointerEventKind.down {
+                root.pointer-inside = true;
+            } else if event.kind == PointerEventKind.cancel {
+                root.pointer-inside = false;
+            } else if event.kind == PointerEventKind.up {
+                root.pointer-inside = root.pointer-position-inside();
+            }
+        }
+
+        // Entrar y salir sin botón apretado no emiten un evento de puntero: lo
+        // avisa `has-hover`. Como es una señal de cambio, si quedó pegado en
+        // true no vuelve a dispararse y no pisa la corrección de arriba.
+        changed has-hover => {
+            root.pointer-inside = self.has-hover;
+        }
 
         // La interfaz de siempre. Se oculta al achicarse al círculo y
         // mientras hay un aviso.
@@ -714,7 +764,10 @@ export component AppWindow inherits Window {
             visible: root.collapsed && root.notice-text == "";
             width: 100%;
             height: 100%;
-            border-radius: 22px;
+            // La mitad del alto: mientras la ventana se achica, el círculo es
+            // una cápsula que se cierra sobre sí misma en vez de un
+            // rectángulo redondeado que salta de forma al final.
+            border-radius: parent.height / 2;
             opacity: 0.35;
             background: #101014cc;
             border-width: 1px;
@@ -764,4 +817,5 @@ export component AppWindow inherits Window {
 
     changed active-panel => { root.panel-changed(root.active-panel); }
     changed width => { root.size-changed(); }
+    changed height => { root.size-changed(); }
 }

@@ -81,3 +81,9 @@ pub fn configure(_ui: &AppWindow) {}
 
 /// Lo mismo para el reanclaje: en el stub no hay ventana nativa que mover.
 pub fn reposition(_ui: &AppWindow) {}
+
+/// El shim no tiene un compositor que recolque la ventana al redimensionarla,
+/// así que se puede animar el cambio de tamaño sin que se corra.
+pub fn animates_resize() -> bool {
+    true
+}

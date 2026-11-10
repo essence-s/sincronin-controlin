@@ -45,3 +45,19 @@ pub fn configure(_ui: &AppWindow) {}
 /// pedirle que recentre la ventana cuando cambia el ancho: la regla de
 /// Hyprland se encarga de ubicarla al abrirla.
 pub fn reposition(_ui: &AppWindow) {}
+
+/// Si la ventana puede animar el cambio de tamaño.
+///
+/// En Wayland no: al redimensionar una ventana flotante, Hyprland mantiene el
+/// centro y recalcula la posición en cada tamaño. Como la posición es entera,
+/// cada paso redondea, y una animación son decenas de pasos: la transición
+/// deja el centro unos píxeles corrido y el error se acumula ciclo tras ciclo
+/// (medido en Hyprland 0.56: +6 px por ciclo, que es justo lo que se ve como
+/// "la ventana se va a la derecha"). Sin animación hay un solo redimensionado
+/// y ese redondeo no acumula.
+///
+/// En X11 la ventana conserva su esquina al cambiar de tamaño, así que animar
+/// no la corre.
+pub fn animates_resize() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_none()
+}

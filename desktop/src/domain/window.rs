@@ -6,6 +6,16 @@ use std::time::{Duration, Instant};
 /// achique al círculo.
 pub const IDLE_COLLAPSE: Duration = Duration::from_secs(2);
 
+/// Margen con el que se arma el temporizador de colapso.
+///
+/// [`WindowIdle::mode`] compara instantes: si el temporizador vence justo en
+/// el umbral puede adelantarse unas décimas de milisegundo, la cuenta todavía
+/// no llega y no se achica. Como el temporizador es de un solo tiro, esa
+/// carrera dejaba la ventana abierta para siempre (pasaba a veces). Armarlo
+/// un poco después del umbral la elimina, y si el mouse vuelve a entrar en el
+/// medio la regla sigue diciendo "normal".
+pub const COLLAPSE_SLACK: Duration = Duration::from_millis(10);
+
 /// En qué forma está la ventana.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowMode {

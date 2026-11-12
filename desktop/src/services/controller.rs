@@ -190,6 +190,8 @@ mod tests {
 
         fn set_state_text(&self, _text: String) {}
 
+        fn set_net_diagnostic(&self, _text: String) {}
+
         fn set_role_text(&self, _text: String) {}
 
         fn set_room_code(&self, code: String) {

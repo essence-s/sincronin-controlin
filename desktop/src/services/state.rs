@@ -80,6 +80,9 @@ impl<M: MediaPort, N: NetPort> StateService<M, N> {
                 self.ui.set_room_count(count);
             }
             NetEvent::Notice(text) => self.ui.append_log(format!("· {text}")),
+            NetEvent::Diagnostic(diagnostic) => {
+                self.ui.set_net_diagnostic(diagnostic.label());
+            }
             NetEvent::Message(text) => self.on_message(text, now),
             NetEvent::ControlledMoved { room } => {
                 self.ui
@@ -378,6 +381,7 @@ mod tests {
         local: Mutex<Vec<(Snapshot, Option<Role>)>>,
         remote: Mutex<Vec<(RemoteState, i64)>>,
         state_texts: Mutex<Vec<String>>,
+        diagnostics: Mutex<Vec<String>>,
         role_texts: Mutex<Vec<String>>,
         room_codes: Mutex<Vec<String>>,
         peer_rooms: Mutex<Vec<String>>,
@@ -405,6 +409,13 @@ mod tests {
 
         fn set_state_text(&self, text: String) {
             self.state_texts
+                .lock()
+                .expect("la UI no está poisoned")
+                .push(text);
+        }
+
+        fn set_net_diagnostic(&self, text: String) {
+            self.diagnostics
                 .lock()
                 .expect("la UI no está poisoned")
                 .push(text);
@@ -986,6 +997,32 @@ mod tests {
                 .expect("la UI no está poisoned")
                 .as_slice(),
             [Notice::PeerJoined]
+        );
+    }
+
+    /// El diagnóstico de red llega a la UI como texto compacto: interfaz,
+    /// tipo de NAT y cantidad de candidatos.
+    #[test]
+    fn the_network_diagnostic_reaches_the_ui_event() {
+        use crate::domain::net::{NatMapping, NetworkDiagnostic};
+
+        let mut h = harness();
+        let diagnostic = NetworkDiagnostic {
+            interface: Some("enp3s0".to_string()),
+            address: Some("192.168.1.8".parse().expect("ip")),
+            nat: NatMapping::Stable,
+            candidates: vec!["192.168.1.8:50000".parse().expect("dirección")],
+        };
+
+        h.service
+            .on_net_event(NetEvent::Diagnostic(diagnostic), Instant::now());
+
+        assert_eq!(
+            h.ui.diagnostics
+                .lock()
+                .expect("la UI no está poisoned")
+                .as_slice(),
+            ["enp3s0 · NAT ok · 1 cand.".to_string()]
         );
     }
 }

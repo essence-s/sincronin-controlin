@@ -120,6 +120,10 @@ impl UiPort for SlintAdapter {
         self.run(move |ui| ui.set_state_text(text.into()));
     }
 
+    fn set_net_diagnostic(&self, text: String) {
+        self.run(move |ui| ui.set_net_diagnostic(text.into()));
+    }
+
     fn set_role_text(&self, text: String) {
         self.run(move |ui| ui.set_role_text(text.into()));
     }

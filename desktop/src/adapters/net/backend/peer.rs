@@ -56,7 +56,9 @@ use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 
-use crate::adapters::net::backend::{self as net, NetState, PeerCommand, PeerOut, Sink};
+use crate::adapters::net::backend::{
+    self as net, NatMapping, NetState, NetworkDiagnostic, PeerCommand, PeerOut, Sink,
+};
 
 /// Etiqueta del canal de datos.
 const CHANNEL_LABEL: &str = "control";
@@ -94,6 +96,9 @@ const STUN_SUCCESS_TYPE: u16 = 0x0101;
 /// El atributo que trae la dirección mapeada, con XOR (RFC 5389 15.2).
 const STUN_MAPPED_ATTR: u16 = 0x0020;
 
+/// El atributo que trae la dirección mapeada sin XOR (RFC 3489).
+const STUN_PLAIN_MAPPED_ATTR: u16 = 0x0001;
+
 /// La magic cookie del RFC 5389.
 pub(crate) const STUN_MAGIC: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 
@@ -109,13 +114,17 @@ struct Session {
     pending: Option<SdpPendingOffer>,
     /// El canal de datos, cuando se abre.
     channel: Option<ChannelId>,
-    /// El binding STUN en curso, si hay servidor configurado.
-    stun: Option<StunQuery>,
+    /// Los bindings STUN en curso: uno por cada servidor configurado.
+    stun: Option<Vec<StunQuery>>,
+    /// Las direcciones mapeadas que contestaron, para clasificar el NAT.
+    mappings: Vec<SocketAddr>,
     /// Los candidatos locales que faltan anunciar.
     ///
     /// El host entra al abrir la sesión; el server reflexive si el STUN
     /// contesta.
     local: Vec<Candidate>,
+    /// Los candidatos locales ya anunciados, para el diagnóstico.
+    announced: Vec<SocketAddr>,
     /// Si ya se anunció lo que había tras el SDP: los candidatos que
     /// llegan después (un srflx a destiempo) se anuncian al momento.
     trickled: bool,
@@ -302,41 +311,56 @@ fn read_once(
     Ok(())
 }
 
-/// Reenvía o rinde el binding STUN si le toca.
+/// Reenvía o rinde cada binding STUN si le toca.
 ///
 /// No es polling que consulta nada: solo un reenvío del mismo request
-/// cuando venció su intervalo, como retransmite ICE.
+/// cuando venció su intervalo, como retransmite ICE. Cada servidor lleva
+/// su propio conteo: uno mudo no frena a los demás.
 fn maintain_stun(current: &mut Session, sink: &Sink) {
-    let Some(mut query) = current.stun.take() else {
+    let Some(queries) = current.stun.take() else {
         return;
     };
 
-    if query.sent_at.elapsed() < STUN_RETRY {
-        current.stun = Some(query);
-        return;
+    let mut active = Vec::new();
+    let mut gave_up = false;
+
+    for mut query in queries {
+        if query.sent_at.elapsed() < STUN_RETRY {
+            active.push(query);
+            continue;
+        }
+
+        if query.attempts >= STUN_ATTEMPTS {
+            gave_up = true;
+            continue;
+        }
+
+        query.attempts += 1;
+        query.sent_at = Instant::now();
+
+        if let Err(err) = current.socket.send_to(&query.request, query.server) {
+            eprintln!("[net] no se pudo reenviar el binding STUN: {err}");
+        }
+
+        active.push(query);
     }
 
-    if query.attempts >= STUN_ATTEMPTS {
-        eprintln!("[net] el servidor STUN no contesta: queda solo el candidato host");
-        net::publish_notice(
-            sink,
-            "el servidor STUN no contesta: sin dirección pública no hay camino a través del NAT",
-        );
-        // `query` queda consumido: el binding ya no corre más.
-        return;
+    if active.is_empty() {
+        if gave_up && current.mappings.is_empty() {
+            eprintln!("[net] ningún servidor STUN contesta: queda solo el candidato host");
+            net::publish_notice(
+                sink,
+                "el servidor STUN no contesta: sin dirección pública no hay camino a través del NAT",
+            );
+        }
+        // `current.stun` queda en `None`: no hay más bindings en curso.
+    } else {
+        current.stun = Some(active);
     }
-
-    query.attempts += 1;
-    query.sent_at = Instant::now();
-
-    if let Err(err) = current.socket.send_to(&query.request, query.server) {
-        eprintln!("[net] no se pudo reenviar el binding STUN: {err}");
-    }
-
-    current.stun = Some(query);
 }
 
-/// Atiende un paquete que puede ser la respuesta a nuestro binding STUN.
+/// Atiende un paquete que puede ser la respuesta a uno de nuestros
+/// bindings STUN.
 ///
 /// Devuelve `true` si lo era: entonces lo maneja acá y no se le pasa a
 /// str0m. Si no, sigue de largo por el camino de siempre.
@@ -347,28 +371,50 @@ fn handle_stun_reply(
     out_tx: &Sender<PeerOut>,
     sink: &Sink,
 ) -> bool {
-    let Some(query) = current.stun.as_ref() else {
+    let Some(request) = current.stun.as_ref().and_then(|queries| {
+        queries
+            .iter()
+            .find(|query| {
+                query.server == source
+                    && query.request.len() >= 20
+                    && buf.len() >= 20
+                    && query.request[8..20] == buf[8..20]
+            })
+            .map(|query| query.request.clone())
+    }) else {
         return false;
     };
-    if source != query.server {
+
+    let Some(reply) = parse_stun_reply(buf, &request) else {
         return false;
+    };
+
+    // Era nuestra: cierra esa transacción, para no volver a retransmitir
+    // ni tratar de leer una segunda contestación del mismo servidor.
+    let empty = if let Some(queries) = current.stun.as_mut() {
+        queries.retain(|query| !(query.server == source && query.request[8..20] == request[8..20]));
+        queries.is_empty()
+    } else {
+        false
+    };
+    if empty {
+        current.stun = None;
     }
-
-    let Some(reply) = parse_stun_reply(buf, &query.request) else {
-        return false;
-    };
-
-    // Es la respuesta que esperábamos: cierra la transacción, para no
-    // volver a retransmitir ni tratar de leer una segunda contestación.
-    current.stun = None;
 
     match reply {
         StunReply::Mapped(mapped) => {
-            eprintln!("[net] STUN: el NAT nos mapea a {mapped}");
-            net::publish_notice(
-                sink,
-                format!("dirección pública detectada por STUN: {mapped}"),
-            );
+            let first = current.mappings.is_empty();
+            // Una entrada por servidor que contestó, aunque coincidan: dos
+            // mapeos iguales son justamente lo que distingue un NAT estable.
+            current.mappings.push(mapped);
+
+            if first {
+                eprintln!("[net] STUN: el NAT nos mapea a {mapped}");
+                net::publish_notice(
+                    sink,
+                    format!("dirección pública detectada por STUN: {mapped}"),
+                );
+            }
 
             let base = match current.socket.local_addr() {
                 Ok(base) => base,
@@ -378,20 +424,26 @@ fn handle_stun_reply(
                 }
             };
 
-            let candidate = match Candidate::server_reflexive(mapped, base, "udp") {
-                Ok(candidate) => candidate,
-                Err(err) => {
-                    eprintln!("[net] no se pudo armar el candidato srflx: {err}");
-                    return true;
-                }
-            };
+            // Un solo srflx alcanza: los mapeos distintos no abren más
+            // caminos sin TURN, y anunciar varios solo agrega checks.
+            if first {
+                let candidate = match Candidate::server_reflexive(mapped, base, "udp") {
+                    Ok(candidate) => candidate,
+                    Err(err) => {
+                        eprintln!("[net] no se pudo armar el candidato srflx: {err}");
+                        return true;
+                    }
+                };
 
-            if current.trickled {
-                // El SDP ya va por señalización: se anuncia solo.
-                add_and_send_local_candidate(current, candidate, out_tx);
-            } else {
-                current.local.push(candidate);
+                if current.trickled {
+                    // El SDP ya va por señalización: se anuncia solo.
+                    add_and_send_local_candidate(current, candidate, out_tx);
+                } else {
+                    current.local.push(candidate);
+                }
             }
+
+            publish_diagnostic(current, sink);
         }
         StunReply::Broken => eprintln!("[net] la respuesta del servidor STUN no sirvió"),
     }
@@ -441,15 +493,21 @@ pub(crate) fn parse_stun_reply(buf: &[u8], request: &[u8]) -> Option<StunReply> 
     while i + 4 <= end {
         let attr = u16::from_be_bytes([buf[i], buf[i + 1]]);
         let attr_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        let value_end = i + 4 + attr_len;
 
-        if i + 4 + attr_len > end {
+        if value_end > end {
             break;
         }
         if attr == STUN_MAPPED_ATTR && (attr_len == 8 || attr_len == 20) {
-            return Some(mapped_from_attr(&buf[i + 4..i + 4 + attr_len]));
+            return Some(xor_mapped_from_attr(&buf[i + 4..value_end]));
+        }
+        if attr == STUN_PLAIN_MAPPED_ATTR && (attr_len == 8 || attr_len == 20) {
+            return Some(plain_mapped_from_attr(&buf[i + 4..value_end]));
         }
 
-        i += 4 + attr_len;
+        // Los atributos se alinean a 4 bytes: el largo declarado no
+        // incluye el relleno.
+        i += 4 + attr_len.div_ceil(4) * 4;
     }
 
     Some(StunReply::Broken)
@@ -459,7 +517,7 @@ pub(crate) fn parse_stun_reply(buf: &[u8], request: &[u8]) -> Option<StunReply> 
 ///
 /// El puerto se desxorea con los dos primeros bytes de la magic, y la IP
 /// byte a byte con los cuatro.
-fn mapped_from_attr(attr: &[u8]) -> StunReply {
+fn xor_mapped_from_attr(attr: &[u8]) -> StunReply {
     let port_xor = u16::from_be_bytes([STUN_MAGIC[0], STUN_MAGIC[1]]);
     let port = u16::from_be_bytes([attr[2], attr[3]]) ^ port_xor;
 
@@ -477,6 +535,25 @@ fn mapped_from_attr(attr: &[u8]) -> StunReply {
         // IPv6: la magic se repite cada 4 bytes.
         0x02 if attr.len() >= 20 => {
             let octets: [u8; 16] = std::array::from_fn(|i| attr[4 + i] ^ STUN_MAGIC[i % 4]);
+
+            let ip = IpAddr::V6(octets.into());
+            StunReply::Mapped(SocketAddr::new(ip, port))
+        }
+        _ => StunReply::Broken,
+    }
+}
+
+/// Decodifica el atributo MAPPED-ADDRESS, sin XOR.
+fn plain_mapped_from_attr(attr: &[u8]) -> StunReply {
+    let port = u16::from_be_bytes([attr[2], attr[3]]);
+
+    match attr[1] {
+        0x01 => {
+            let ip = IpAddr::V4(Ipv4Addr::new(attr[4], attr[5], attr[6], attr[7]));
+            StunReply::Mapped(SocketAddr::new(ip, port))
+        }
+        0x02 if attr.len() >= 20 => {
+            let octets: [u8; 16] = std::array::from_fn(|i| attr[4 + i]);
 
             let ip = IpAddr::V6(octets.into());
             StunReply::Mapped(SocketAddr::new(ip, port))
@@ -508,7 +585,7 @@ fn handle_command(
             }
             current.offered = true;
 
-            if let Err(err) = make_offer(current, out_tx) {
+            if let Err(err) = make_offer(current, out_tx, sink) {
                 eprintln!("[net] no se pudo hacer la oferta: {err}");
                 net::publish_notice(sink, format!("no se pudo hacer la oferta: {err}"));
             }
@@ -519,7 +596,7 @@ fn handle_command(
                 return true;
             };
 
-            if let Err(err) = accept_offer(current, &sdp, out_tx) {
+            if let Err(err) = accept_offer(current, &sdp, out_tx, sink) {
                 eprintln!("[net] no se pudo aceptar la oferta: {err}");
                 net::publish_notice(sink, format!("no se pudo aceptar la oferta: {err}"));
             }
@@ -585,7 +662,11 @@ fn session_for<'a>(
             eprintln!("[net] se abre el par con el equipo {peer}");
 
             match start(peer) {
-                Ok(new) => Some(slot.insert(new)),
+                Ok(new) => {
+                    let session = slot.insert(new);
+                    publish_diagnostic(session, sink);
+                    Some(session)
+                }
                 Err(err) => {
                     eprintln!("[net] no se pudo abrir el socket: {err}");
                     net::publish_notice(sink, format!("no se pudo abrir el socket UDP: {err}"));
@@ -616,40 +697,57 @@ fn start(peer: u64) -> io::Result<Session> {
         pending: None,
         channel: None,
         stun,
+        mappings: Vec::new(),
         local: vec![host],
+        announced: Vec::new(),
         trickled: false,
         offered: false,
         dropped: false,
     })
 }
 
-/// Arma y manda el primer binding STUN, si hay servidor configurado.
+/// Arma y manda un binding STUN por cada servidor configurado.
 ///
-/// Sale por el mismo socket que la sesión: la dirección mapeada que
-/// devuelve el servidor sirve como candidato del par ICE, porque es hacia
-/// donde se va el tráfico real.
-fn start_stun(socket: &UdpSocket, local_addr: SocketAddr) -> Option<StunQuery> {
-    let server_name = net::stun_server()?;
+/// Todos salen por el mismo socket que la sesión: la dirección mapeada que
+/// devuelve cada servidor sirve como candidato del par ICE, porque es hacia
+/// donde se va el tráfico real. Van con transacciones distintas y no se
+/// esperan entre sí.
+fn start_stun(socket: &UdpSocket, local_addr: SocketAddr) -> Option<Vec<StunQuery>> {
+    let mut queries = Vec::new();
+    let mut seen = Vec::new();
 
-    let Some(server) = resolve_stun(&server_name, local_addr.is_ipv4()) else {
-        eprintln!("[net] no se pudo resolver el servidor STUN: {server_name}");
-        return None;
-    };
+    for server_name in net::stun_servers() {
+        let Some(server) = resolve_stun(&server_name, local_addr.is_ipv4()) else {
+            eprintln!("[net] no se pudo resolver el servidor STUN: {server_name}");
+            continue;
+        };
 
-    let request = new_stun_request();
-    if let Err(err) = socket.send_to(&request, server) {
-        eprintln!("[net] no se pudo mandar el binding al servidor STUN: {err}");
-        return None;
+        if seen.contains(&server) {
+            continue;
+        }
+        seen.push(server);
+
+        let request = new_stun_request();
+        if let Err(err) = socket.send_to(&request, server) {
+            eprintln!("[net] no se pudo mandar el binding al servidor STUN: {err}");
+            continue;
+        }
+
+        eprintln!("[net] binding STUN a {server}");
+
+        queries.push(StunQuery {
+            server,
+            request,
+            sent_at: Instant::now(),
+            attempts: 1,
+        });
     }
 
-    eprintln!("[net] binding STUN a {server}");
-
-    Some(StunQuery {
-        server,
-        request,
-        sent_at: Instant::now(),
-        attempts: 1,
-    })
+    if queries.is_empty() {
+        None
+    } else {
+        Some(queries)
+    }
 }
 
 /// Arma el request del binding del RFC 5389: encabezado de 20 bytes, un
@@ -724,7 +822,11 @@ fn resolve_stun(server: &str, ipv4: bool) -> Option<SocketAddr> {
 }
 
 /// Crea el canal de datos, arma la oferta y la manda.
-fn make_offer(current: &mut Session, out_tx: &Sender<PeerOut>) -> Result<(), RtcError> {
+fn make_offer(
+    current: &mut Session,
+    out_tx: &Sender<PeerOut>,
+    sink: &Sink,
+) -> Result<(), RtcError> {
     let (offer, pending) = {
         let mut changes = current.rtc.sdp_api();
         changes.add_channel_with_config(ChannelConfig {
@@ -750,7 +852,7 @@ fn make_offer(current: &mut Session, out_tx: &Sender<PeerOut>) -> Result<(), Rtc
     eprintln!("[net] mandé la oferta");
 
     // Los candidatos van después del SDP: es trickle ICE puro.
-    trickle_local_candidates(current, out_tx);
+    trickle_local_candidates(current, out_tx, sink);
 
     Ok(())
 }
@@ -760,6 +862,7 @@ fn accept_offer(
     current: &mut Session,
     sdp: &Value,
     out_tx: &Sender<PeerOut>,
+    sink: &Sink,
 ) -> Result<(), RtcError> {
     let offer: SdpOffer = serde_json::from_value(sdp.clone())
         .map_err(|err| RtcError::RemoteSdp(format!("oferta que no se entiende: {err}")))?;
@@ -774,7 +877,7 @@ fn accept_offer(
     eprintln!("[net] acepté la oferta y mandé la respuesta");
 
     // Los candidatos van después del SDP: es trickle ICE puro.
-    trickle_local_candidates(current, out_tx);
+    trickle_local_candidates(current, out_tx, sink);
 
     Ok(())
 }
@@ -798,7 +901,7 @@ fn accept_answer(current: &mut Session, sdp: &Value) -> Result<(), RtcError> {
 /// Se hace después de armar el SDP a propósito: los candidatos viajan como
 /// mensajes `ice` (trickle), no embebidos en el SDP. También queda
 /// marcado: si llega otro candidato (el srflx del STUN) se anuncia solo.
-fn trickle_local_candidates(current: &mut Session, out_tx: &Sender<PeerOut>) {
+fn trickle_local_candidates(current: &mut Session, out_tx: &Sender<PeerOut>, sink: &Sink) {
     let queued = std::mem::take(&mut current.local);
 
     for candidate in queued {
@@ -806,6 +909,7 @@ fn trickle_local_candidates(current: &mut Session, out_tx: &Sender<PeerOut>) {
     }
 
     current.trickled = true;
+    publish_diagnostic(current, sink);
 }
 
 /// Agrega el candidato al `Rtc` y lo manda por la señalización.
@@ -822,6 +926,8 @@ fn add_and_send_local_candidate(
         eprintln!("[net] el candidato local fue rechazado");
         return;
     };
+
+    current.announced.push(stored.addr());
 
     match serde_json::to_value(stored) {
         Ok(value) => {
@@ -910,18 +1016,121 @@ fn handle_event(event: Event, current: &mut Session, sink: &Sink) {
 
 /// La dirección donde se abre el socket UDP.
 ///
-/// Primero `SINC_NET_ADDR`, después la primera IPv4 que no sea de
-/// loopback y, si no hay ninguna, el loopback.
+/// Primero `SINC_NET_ADDR`, después la interfaz con ruta de salida y, si
+/// no hay, la primera IPv4 que no sea de loopback. El loopback es el
+/// último recurso.
 fn local_address() -> io::Result<SocketAddr> {
-    if let Some(ip) = net::local_address_hint() {
-        return Ok(SocketAddr::new(ip, 0));
+    let hint = net::local_address_hint();
+    let routed = if hint.is_none() {
+        route_address()
+    } else {
+        None
+    };
+    let fallback = if hint.is_none() && routed.is_none() {
+        first_usable_ipv4()
+    } else {
+        None
+    };
+
+    local_address_with(hint, routed, fallback)
+}
+
+/// Elige la dirección del socket: el override, la de la ruta y, si no, la
+/// primera IPv4 usable.
+fn local_address_with(
+    hint: Option<IpAddr>,
+    routed: Option<IpAddr>,
+    fallback: Option<IpAddr>,
+) -> io::Result<SocketAddr> {
+    let ip = hint
+        .or(routed)
+        .or(fallback)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    Ok(SocketAddr::new(ip, 0))
+}
+
+/// La IP local que el sistema elige para salir a internet.
+///
+/// Prueba la ruta al STUN y, si no hay, al servidor de señalización.
+/// `connect` en UDP no manda nada: solo hace que el sistema elija la
+/// interfaz con salida y revele su dirección.
+fn route_address() -> Option<IpAddr> {
+    for target in route_targets() {
+        let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+
+        if let Some(ip) = socket
+            .local_addr()
+            .ok()
+            .and_then(|addr| usable_ip(addr.ip()))
+        {
+            return Some(ip);
+        }
     }
 
-    if let Some(ip) = first_usable_ipv4() {
-        return Ok(SocketAddr::new(ip, 0));
+    None
+}
+
+/// Descarta las direcciones que no sirven para anunciar a otro equipo.
+///
+/// Con la señalización por defecto (`127.0.0.1`) y sin STUN, la ruta
+/// apuntaría al loopback: ese socket no alcanza a otra máquina, así que
+/// se sigue con la primera interfaz usable.
+fn usable_ip(ip: IpAddr) -> Option<IpAddr> {
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+/// Los destinos con los que se prueba la ruta: primero el STUN y después
+/// el servidor de señalización.
+fn route_targets() -> Vec<SocketAddr> {
+    let mut targets = Vec::new();
+
+    for server in net::stun_servers() {
+        targets.extend(
+            resolve_stun_targets(&server)
+                .into_iter()
+                .filter(SocketAddr::is_ipv4),
+        );
+    }
+    if let Some(addr) = signal_address().filter(SocketAddr::is_ipv4) {
+        targets.push(addr);
     }
 
-    Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+    targets
+}
+
+/// Resuelve todas las direcciones del servidor STUN.
+fn resolve_stun_targets(server: &str) -> Vec<SocketAddr> {
+    let target = if server.contains(':') {
+        server.to_string()
+    } else {
+        format!("{server}:{STUN_PORT}")
+    };
+
+    target
+        .to_socket_addrs()
+        .map(|addrs| addrs.collect())
+        .unwrap_or_default()
+}
+
+/// La dirección del servidor de señalización.
+fn signal_address() -> Option<SocketAddr> {
+    let uri: tungstenite::http::Uri = net::signal_url().parse().ok()?;
+    let host = uri.host()?;
+    let port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        }
+    });
+
+    (host, port).to_socket_addrs().ok()?.next()
 }
 
 /// La primera IPv4 de una interfaz que no sea de loopback.
@@ -938,6 +1147,51 @@ fn first_usable_ipv4() -> Option<IpAddr> {
     }
 
     None
+}
+
+/// Cómo mapea el NAT, comparando lo que vieron los STUN.
+///
+/// Con una sola respuesta no se puede comparar; con dos o más, si todas
+/// coinciden el mapeo no depende del destino.
+fn classify_nat(mappings: &[SocketAddr]) -> NatMapping {
+    let Some(first) = mappings.first() else {
+        return NatMapping::Unknown;
+    };
+
+    if mappings.len() < 2 {
+        return NatMapping::Unknown;
+    }
+
+    if mappings.iter().all(|mapped| mapped == first) {
+        NatMapping::Stable
+    } else {
+        NatMapping::ChangesWithDestination
+    }
+}
+
+/// Publica el diagnóstico de red de la sesión.
+fn publish_diagnostic(current: &Session, sink: &Sink) {
+    let Ok(local) = current.socket.local_addr() else {
+        return;
+    };
+
+    let diagnostic = NetworkDiagnostic {
+        interface: interface_name(local.ip()),
+        address: Some(local.ip()),
+        nat: classify_nat(&current.mappings),
+        candidates: current.announced.clone(),
+    };
+
+    net::publish_diagnostic(sink, diagnostic);
+}
+
+/// El nombre de la interfaz que tiene esa IP.
+fn interface_name(ip: IpAddr) -> Option<String> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find(|interface| interface.ip() == ip)
+        .map(|interface| interface.name)
 }
 
 #[cfg(test)]
@@ -960,11 +1214,122 @@ mod tests {
         (sink, events)
     }
 
+    /// La dirección del socket sale de la ruta, no de la primera IPv4 de la
+    /// máquina: con Docker o una VPN, la primera puede no tener salida.
+    #[test]
+    fn the_socket_uses_the_address_with_a_route() {
+        let routed: IpAddr = "192.0.2.20".parse().expect("ip");
+        let first: IpAddr = "192.0.2.10".parse().expect("ip");
+
+        let picked =
+            local_address_with(None, Some(routed), Some(first)).expect("dirección del socket");
+
+        assert_eq!(picked.ip(), routed);
+    }
+
+    /// El override manda sobre la ruta: sirve para forzar una interfaz
+    /// cuando la detección automática no elige la que se quiere.
+    #[test]
+    fn the_configured_address_wins_over_the_route() {
+        let hint: IpAddr = "192.0.2.30".parse().expect("ip");
+        let routed: IpAddr = "192.0.2.20".parse().expect("ip");
+
+        let picked = local_address_with(Some(hint), Some(routed), None).expect("dirección");
+
+        assert_eq!(picked.ip(), hint);
+    }
+
+    /// La ruta al servidor de señalización local apunta al loopback: esa
+    /// dirección no sirve para anunciarse, así que se descarta.
+    #[test]
+    fn a_loopback_route_is_not_used() {
+        let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+        let lan: IpAddr = "192.0.2.20".parse().expect("ip");
+
+        assert_eq!(usable_ip(loopback), None);
+        assert_eq!(usable_ip(lan), Some(lan));
+    }
+
+    /// Dos STUN que ven el mismo mapeo: el NAT no cambia la dirección
+    /// según el destino.
+    #[test]
+    fn the_diagnostic_reports_a_stable_mapping() {
+        let mapped: SocketAddr = "203.0.113.7:40000".parse().expect("dirección");
+
+        assert_eq!(classify_nat(&[mapped, mapped]), NatMapping::Stable);
+    }
+
+    /// Dos STUN que ven mapeos distintos: el NAT cambia la dirección según
+    /// el destino (simétrico o address-dependent).
+    #[test]
+    fn the_diagnostic_reports_a_mapping_that_changes_with_the_destination() {
+        let first: SocketAddr = "203.0.113.7:40000".parse().expect("dirección");
+        let second: SocketAddr = "203.0.113.7:40001".parse().expect("dirección");
+
+        assert_eq!(
+            classify_nat(&[first, second]),
+            NatMapping::ChangesWithDestination
+        );
+    }
+
+    /// Una respuesta con un atributo de largo impar y su relleno de 4 bytes
+    /// antes del XOR-MAPPED-ADDRESS se entiende igual.
+    #[test]
+    fn a_reply_with_padded_attributes_is_parsed() {
+        let request = new_stun_request();
+        let mapped: SocketAddr = "203.0.113.7:40000".parse().expect("dirección");
+
+        let mut reply = binding_success_reply(&request, mapped);
+        let mapped_attr = reply.split_off(20);
+        reply[2..4].copy_from_slice(&20u16.to_be_bytes());
+        // SOFTWARE (0x8022), largo 3 y un byte de relleno.
+        reply.extend_from_slice(&[0x80, 0x22, 0x00, 0x03, b'a', b'b', b'c', 0x00]);
+        reply.extend_from_slice(&mapped_attr);
+
+        let StunReply::Mapped(parsed) =
+            parse_stun_reply(&reply, &request).expect("es la respuesta")
+        else {
+            panic!("no se entendió la dirección mapeada");
+        };
+
+        assert_eq!(parsed, mapped);
+    }
+
+    /// Algunos servidores contestan con MAPPED-ADDRESS sin XOR: también se
+    /// acepta.
+    #[test]
+    fn a_plain_mapped_address_is_accepted() {
+        let request = new_stun_request();
+        let mapped: SocketAddr = "203.0.113.7:40000".parse().expect("dirección");
+
+        let mut reply = [0u8; 32];
+        reply[0..2].copy_from_slice(&STUN_SUCCESS_TYPE.to_be_bytes());
+        reply[2..4].copy_from_slice(&12u16.to_be_bytes());
+        reply[4..8].copy_from_slice(&STUN_MAGIC);
+        reply[8..20].copy_from_slice(&request[8..20]);
+        reply[20..22].copy_from_slice(&0x0001u16.to_be_bytes());
+        reply[22..24].copy_from_slice(&8u16.to_be_bytes());
+        reply[25] = 0x01;
+        reply[26..28].copy_from_slice(&mapped.port().to_be_bytes());
+        let IpAddr::V4(ip) = mapped.ip() else {
+            panic!("la dirección de prueba tiene que ser IPv4");
+        };
+        reply[28..32].copy_from_slice(&ip.octets());
+
+        let StunReply::Mapped(parsed) =
+            parse_stun_reply(&reply, &request).expect("es la respuesta")
+        else {
+            panic!("no se entendió la dirección mapeada");
+        };
+
+        assert_eq!(parsed, mapped);
+    }
+
     /// Una sesión despojada: socket y `Rtc` apenas nacidos.
     ///
     /// Alcanza para los avisos: no hay conversación con el otro equipo,
     /// solo eventos de ICE y la rendición del binding STUN.
-    fn bare_session(stun: Option<StunQuery>) -> Session {
+    fn bare_session(stun: Option<Vec<StunQuery>>) -> Session {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("socket de pruebas");
 
         Session {
@@ -974,7 +1339,9 @@ mod tests {
             pending: None,
             channel: None,
             stun,
+            mappings: Vec::new(),
             local: vec![],
+            announced: Vec::new(),
             trickled: false,
             offered: false,
             dropped: false,
@@ -1123,7 +1490,7 @@ mod tests {
             sent_at: Instant::now() - STUN_RETRY - Duration::from_secs(1),
             attempts: STUN_ATTEMPTS,
         };
-        let mut session = bare_session(Some(query));
+        let mut session = bare_session(Some(vec![query]));
 
         maintain_stun(&mut session, &sink);
 

@@ -135,6 +135,20 @@ fn translate(event: NetRawEvent) -> NetEvent {
         NetRawEvent::RoomCount(count) => NetEvent::RoomCount(count),
         NetRawEvent::ControlledMoved { room } => NetEvent::ControlledMoved { room },
         NetRawEvent::ControlledLeft => NetEvent::ControlledLeft,
+        NetRawEvent::Diagnostic(diagnostic) => {
+            NetEvent::Diagnostic(crate::domain::net::NetworkDiagnostic {
+                interface: diagnostic.interface,
+                address: diagnostic.address,
+                nat: match diagnostic.nat {
+                    net::NatMapping::Unknown => crate::domain::net::NatMapping::Unknown,
+                    net::NatMapping::Stable => crate::domain::net::NatMapping::Stable,
+                    net::NatMapping::ChangesWithDestination => {
+                        crate::domain::net::NatMapping::ChangesWithDestination
+                    }
+                },
+                candidates: diagnostic.candidates,
+            })
+        }
     }
 }
 

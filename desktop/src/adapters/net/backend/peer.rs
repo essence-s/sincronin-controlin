@@ -25,8 +25,8 @@
 //! Cuando el sistema avisa que cambió una interfaz (netlink en Linux,
 //! `NotifyIpInterfaceChange` en Windows), el hilo vuelve a enumerar y abre
 //! un socket por cada dirección nueva, que se anuncia por trickle. Los
-//! enlaces viejos no se cierran: reemplazarlos queda para cuando haya
-//! ICE restart.
+//! enlaces viejos no se cierran: el ICE restart conserva todos los
+//! candidatos y los nuevos entran por trickle.
 //!
 //! ## El STUN
 //!
@@ -49,11 +49,11 @@
 //!
 //! ## Lo que cuenta el ICE
 //!
-//! El estado del ICE también desembolsa un aviso del panel: si la
-//! conexión se interrumpe, sale escrito, aunque la etiqueta global
-//! ("Esperando al otro equipo" / "Conectado") no cambie, porque el
-//! rehacer suele ser pasajero. Si la conexión vuelve, sale el aviso de
-//! la vuelta.
+//! Si el ICE se interrumpe, el panel pasa a «Reconectando…» y arranca un
+//! plan de reintentos: el controlado reinicia el ICE con credenciales
+//! nuevas (el controlador solo contesta), con backoff y un tope. Si la
+//! conexión vuelve, la etiqueta pasa a «Conectado»; si no, a «Sin
+//! conexión» y hay que emparejar de nuevo.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -72,6 +72,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 use crate::adapters::net::backend::{
     self as net, NatMapping, NetState, NetworkDiagnostic, PeerCommand, PeerOut, Sink,
 };
+use crate::domain::net::RetryPlan;
 
 /// Etiqueta del canal de datos.
 const CHANNEL_LABEL: &str = "control";
@@ -131,10 +132,30 @@ struct Session {
     offered: bool,
     /// Si ya avisó que la conexión se interrumpió.
     ///
-    /// La interrupción del ICE puede ser pasajera: el aviso marca para
-    /// que la vuelta, si llega, también avise, y así el panel no queda
-    /// con una falla que ya no vale.
+    /// La interrupción del ICE puede ser pasajera: la marca hace que la
+    /// vuelta, si llega, avise, y que una caída repetida no reinicie el
+    /// plan de reintentos.
     dropped: bool,
+    /// El plan de reintentos mientras la conexión está caída.
+    retry: Option<Retry>,
+}
+
+/// Un reintento de conexión en curso.
+#[derive(Clone, Copy)]
+struct Retry {
+    /// El plan de esperas.
+    plan: RetryPlan,
+    /// Cuándo toca el próximo paso.
+    at: Instant,
+}
+
+impl Retry {
+    /// Arranca el plan desde la caída.
+    fn new(now: Instant) -> Self {
+        let plan = RetryPlan::default();
+        let at = now + plan.next_delay().expect("el plan arranca con un paso");
+        Self { plan, at }
+    }
 }
 
 /// Un enlace de red: un socket y los candidatos que salen de él.
@@ -208,6 +229,8 @@ pub(crate) fn run(
         for current in sessions.values_mut() {
             // El binding STUN se reenvía si le toca: no depende de str0m.
             maintain_stun(current, &sink);
+            // El reintento de ICE también: es un plazo, no una consulta.
+            maintain_retry(current, &out_tx, &sink);
 
             match pump(current, &sink) {
                 Ok(at) => earliest = earliest.min(at),
@@ -218,6 +241,10 @@ pub(crate) fn run(
                     );
                     broken.push(current.peer);
                 }
+            }
+
+            if let Some(retry) = &current.retry {
+                earliest = earliest.min(retry.at);
             }
         }
 
@@ -418,6 +445,66 @@ fn maintain_stun(current: &mut Session, sink: &Sink) {
             "el servidor STUN no contesta: sin dirección pública no hay camino a través del NAT",
         );
     }
+}
+
+/// Revisa si le toca reintentar la conexión y lo hace.
+///
+/// Solo el que ofrece puede reiniciar el ICE: el controlador espera la
+/// oferta. Los dos llevan el mismo plan, así que si el controlado no
+/// vuelve, los dos se rinden a la vez.
+fn maintain_retry(current: &mut Session, out_tx: &Sender<PeerOut>, sink: &Sink) {
+    let Some(retry) = current.retry else {
+        return;
+    };
+
+    let now = Instant::now();
+    if retry.at > now {
+        return;
+    }
+
+    if current.offered && retry.plan.next_is_retry() {
+        restart_ice(current, out_tx);
+    }
+
+    let mut plan = retry.plan;
+    plan.advance();
+
+    if plan.is_exhausted() {
+        current.retry = None;
+        net::publish_state(sink, NetState::SinConexion);
+        net::publish_notice(
+            sink,
+            "no se pudo recuperar la conexión: hay que emparejar de nuevo",
+        );
+    } else {
+        current.retry = Some(Retry {
+            plan,
+            at: now + plan.next_delay().expect("queda un paso"),
+        });
+    }
+}
+
+/// Reinicia el ICE con credenciales nuevas, conservando los candidatos.
+///
+/// Los enlaces nuevos que abrió un cambio de red ya se anunciaron por
+/// trickle; acá no hay que volver a juntar nada.
+fn restart_ice(current: &mut Session, out_tx: &Sender<PeerOut>) {
+    let mut changes = current.rtc.sdp_api();
+    changes.ice_restart(true);
+
+    let Some((offer, pending)) = changes.apply() else {
+        return;
+    };
+
+    current.pending = Some(pending);
+
+    let value = serde_json::to_value(&offer).expect("el SDP se serializa");
+    let _ = out_tx.send(PeerOut::Offer {
+        to: current.peer,
+        sdp: value,
+    });
+
+    eprintln!("[net] reintento de ICE con el equipo {}", current.peer);
 }
 
 /// Atiende un paquete que puede ser la respuesta a uno de nuestros
@@ -717,6 +804,13 @@ fn handle_command(
             sessions.remove(&peer);
             true
         }
+        #[cfg(test)]
+        PeerCommand::SimulateDrop => {
+            for current in sessions.values_mut() {
+                on_drop(current, sink);
+            }
+            true
+        }
         PeerCommand::Stop => {
             // Se sale de la sala: se caen todos los pares.
             sessions.clear();
@@ -767,6 +861,7 @@ fn start_with(peer: u64, addresses: &[IpAddr]) -> io::Result<Session> {
         channel: None,
         offered: false,
         dropped: false,
+        retry: None,
     })
 }
 
@@ -1142,6 +1237,18 @@ fn send_message(current: &mut Session, text: &str, sink: &Sink) {
     }
 }
 
+/// Marca la caída y arma el plan de reintentos.
+fn on_drop(current: &mut Session, sink: &Sink) {
+    if current.dropped {
+        return;
+    }
+
+    current.dropped = true;
+    current.retry = Some(Retry::new(Instant::now()));
+    net::publish_state(sink, NetState::Reconectando);
+    net::publish_notice(sink, "la conexión con el otro equipo falló");
+}
+
 /// Atiende un evento de `str0m`.
 fn handle_event(event: Event, current: &mut Session, sink: &Sink) {
     match event {
@@ -1170,16 +1277,16 @@ fn handle_event(event: Event, current: &mut Session, sink: &Sink) {
 
             match state {
                 // La interrupción puede ser pasajera (el agente de ICE se
-                // rehace solo): no toca la etiqueta global del panel, solo
-                // deja escrito el aviso, y si la conexión vuelve, otro.
+                // rehace solo), pero el panel pasa a «Reconectando…» y se
+                // arma el plan por si no vuelve.
                 IceConnectionState::Disconnected => {
-                    current.dropped = true;
-                    net::publish_notice(sink, "la conexión con el otro equipo falló");
+                    on_drop(current, sink);
                 }
                 IceConnectionState::Connected | IceConnectionState::Completed
                     if current.dropped =>
                 {
                     current.dropped = false;
+                    current.retry = None;
                     net::publish_state(sink, NetState::Conectado);
                     net::publish_notice(sink, "la conexión con el otro equipo quedó establecida");
                 }
@@ -1761,6 +1868,7 @@ mod tests {
             channel: None,
             offered: false,
             dropped: false,
+            retry: None,
         }
     }
 
@@ -1780,7 +1888,17 @@ mod tests {
             channel: None,
             offered: false,
             dropped: false,
+            retry: None,
         }
+    }
+
+    /// El ufrag del ICE que lleva el SDP.
+    fn ufrag(sdp: &Value) -> String {
+        let text = sdp["sdp"].as_str().expect("el SDP es texto");
+        let start = text.find("a=ice-ufrag:").expect("trae ufrag") + "a=ice-ufrag:".len();
+        let rest = &text[start..];
+        let end = rest.find("\r\n").expect("el ufrag termina en CRLF");
+        rest[..end].to_string()
     }
 
     /// La respuesta de un binding parsea, y trae la dirección mapeada.
@@ -1814,14 +1932,14 @@ mod tests {
         assert!(parse_stun_reply(&reply, &request).is_none());
     }
 
-    /// El ICE interrumpido avisa, sin tocar la etiqueta global: la
-    /// interrupción puede ser pasajera.
+    /// El ICE interrumpido pasa la etiqueta a «Reconectando…» y deja el
+    /// plan de reintentos armado.
     #[test]
-    fn the_ice_drop_notices_without_touching_the_state() {
+    fn a_drop_shows_reconnecting() {
         let (sink, events) = test_sink();
         let mut session = bare_session(None);
 
-        // Que esté Diseñando no es una interrupción: ni aviso.
+        // Que esté revisando no es una interrupción: ni aviso.
         handle_event(
             Event::IceConnectionStateChange(IceConnectionState::Checking),
             &mut session,
@@ -1842,31 +1960,36 @@ mod tests {
         );
 
         let recorded = events.lock().expect("el registro no está poisoned").clone();
-        assert_eq!(recorded.len(), 1, "solo el aviso: {recorded:?}");
-        let net::Event::Notice(text) = &recorded[0] else {
-            panic!("no fue un aviso: {recorded:?}");
-        };
-        assert!(
-            text.contains("falló"),
-            "el aviso no aclara la falla: {text}"
-        );
-
-        // Sin estado global: la interrupción no cambia la etiqueta.
         assert!(
             recorded
                 .iter()
-                .all(|event| !matches!(event, net::Event::State(_))),
-            "la interrupción no toca la etiqueta: {recorded:?}"
+                .any(|event| matches!(event, net::Event::State(NetState::Reconectando))),
+            "falta la etiqueta de reconexión: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, net::Event::Notice(text) if text.contains("falló"))),
+            "falta el aviso de la caída: {recorded:?}"
         );
         assert!(session.dropped, "quedó marcada la caída para la vuelta");
+        assert!(session.retry.is_some(), "quedó armado el reintento");
     }
 
-    /// Si el ICE se rehace, avisa y vuelve a conectar la etiqueta.
+    /// Si el ICE se rehace, la vuelta avisa, vuelve a conectar la etiqueta
+    /// y cancela el reintento pendiente.
     #[test]
-    fn the_ice_recovery_notices_after_a_drop() {
+    fn a_recovery_sends_no_restart_and_shows_connected() {
         let (sink, events) = test_sink();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
         let mut session = bare_session(None);
-        session.dropped = true;
+
+        handle_event(
+            Event::IceConnectionStateChange(IceConnectionState::Disconnected),
+            &mut session,
+            &sink,
+        );
+        session.retry.as_mut().expect("quedó armado").at = Instant::now();
 
         handle_event(
             Event::IceConnectionStateChange(IceConnectionState::Completed),
@@ -1884,10 +2007,165 @@ mod tests {
         assert!(
             recorded
                 .iter()
-                .any(|event| matches!(event, net::Event::State(net::NetState::Conectado))),
+                .any(|event| matches!(event, net::Event::State(NetState::Conectado))),
             "falta volver a conectar la etiqueta: {recorded:?}"
         );
         assert!(!session.dropped, "la caída ya no vale");
+        assert!(session.retry.is_none(), "la vuelta canceló el plan");
+
+        // Aunque el plazo ya hubiera vencido, no manda oferta.
+        maintain_retry(&mut session, &out_tx, &sink);
+        assert!(
+            out_rx.try_recv().is_err(),
+            "la vuelta no dispara un reintento"
+        );
+    }
+
+    /// Solo el que ofrece puede reiniciar el ICE: manda una oferta con
+    /// credenciales nuevas y el otro la contesta.
+    #[test]
+    fn the_offerer_reoffers_after_the_margin() {
+        let (sink_a, _) = test_sink();
+        let (sink_b, _) = test_sink();
+        let (out_a_tx, out_a_rx) = crossbeam_channel::unbounded();
+        let (out_b_tx, out_b_rx) = crossbeam_channel::unbounded();
+
+        let mut offerer = bare_session(None);
+        offerer.offered = true;
+        let mut answerer = bare_session(None);
+
+        make_offer(&mut offerer, &out_a_tx, &sink_a).expect("la oferta inicial");
+        let PeerOut::Offer {
+            sdp: first_offer, ..
+        } = out_a_rx.try_recv().expect("salió la oferta")
+        else {
+            panic!("no fue una oferta");
+        };
+
+        accept_offer(&mut answerer, &first_offer, &out_b_tx, &sink_b)
+            .expect("la respuesta inicial");
+        let PeerOut::Answer {
+            sdp: first_answer, ..
+        } = out_b_rx.try_recv().expect("salió la respuesta")
+        else {
+            panic!("no fue una respuesta");
+        };
+        accept_answer(&mut offerer, &first_answer).expect("se acepta la respuesta inicial");
+
+        // Se corta y el margen ya venció.
+        handle_event(
+            Event::IceConnectionStateChange(IceConnectionState::Disconnected),
+            &mut offerer,
+            &sink_a,
+        );
+        offerer.retry.as_mut().expect("quedó armado").at = Instant::now();
+
+        maintain_retry(&mut offerer, &out_a_tx, &sink_a);
+
+        let PeerOut::Offer {
+            sdp: restart_offer, ..
+        } = out_a_rx.try_recv().expect("salió la oferta del reintento")
+        else {
+            panic!("no fue una oferta");
+        };
+        assert_ne!(
+            ufrag(&restart_offer),
+            ufrag(&first_offer),
+            "el restart tiene que llevar credenciales nuevas"
+        );
+
+        accept_offer(&mut answerer, &restart_offer, &out_b_tx, &sink_b)
+            .expect("el otro lado acepta el restart");
+        let PeerOut::Answer {
+            sdp: restart_answer,
+            ..
+        } = out_b_rx.try_recv().expect("salió la respuesta del restart")
+        else {
+            panic!("no fue una respuesta");
+        };
+        accept_answer(&mut offerer, &restart_answer).expect("se acepta la respuesta del restart");
+        assert!(offerer.pending.is_none(), "quedó cerrada la negociación");
+    }
+
+    /// El controlador no ofrece: espera la oferta del controlado.
+    #[test]
+    fn the_answerer_never_reoffers() {
+        let (sink, events) = test_sink();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let mut session = bare_session(None);
+
+        handle_event(
+            Event::IceConnectionStateChange(IceConnectionState::Disconnected),
+            &mut session,
+            &sink,
+        );
+        session.retry.as_mut().expect("quedó armado").at = Instant::now();
+
+        maintain_retry(&mut session, &out_tx, &sink);
+
+        assert!(
+            out_rx.try_recv().is_err(),
+            "el controlador no puede iniciar el restart"
+        );
+        assert!(
+            session.retry.is_some(),
+            "sigue esperando a que el controlado vuelva"
+        );
+        assert!(
+            events
+                .lock()
+                .expect("el registro no está poisoned")
+                .iter()
+                .any(|event| matches!(event, net::Event::State(NetState::Reconectando))),
+            "igual muestra que está reconectando"
+        );
+    }
+
+    /// Cuando se agotan los reintentos, deja de ofrecer y avisa que hay
+    /// que emparejar de nuevo.
+    #[test]
+    fn giving_up_shows_sin_conexion_and_warns() {
+        let (sink, events) = test_sink();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let mut session = bare_session(None);
+        session.offered = true;
+
+        handle_event(
+            Event::IceConnectionStateChange(IceConnectionState::Disconnected),
+            &mut session,
+            &sink,
+        );
+
+        // Cinco reintentos y la gracia final.
+        for _ in 0..6 {
+            session.retry.as_mut().expect("queda plan").at = Instant::now();
+            maintain_retry(&mut session, &out_tx, &sink);
+        }
+
+        let offers = out_rx
+            .try_iter()
+            .filter(|out| matches!(out, PeerOut::Offer { .. }))
+            .count();
+        assert_eq!(offers, 5, "cinco reintentos antes de rendirse");
+        assert!(session.retry.is_none(), "dejó de reintentar");
+
+        let recorded = events.lock().expect("el registro no está poisoned").clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, net::Event::State(NetState::SinConexion))),
+            "falta la etiqueta de sin conexión: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(
+                |event| matches!(event, net::Event::Notice(text) if text.contains("emparejar"))
+            ),
+            "falta el aviso para emparejar de nuevo: {recorded:?}"
+        );
+
+        // Un vencimiento más no manda nada.
+        maintain_retry(&mut session, &out_tx, &sink);
+        assert!(out_rx.try_recv().is_err(), "no quedan reintentos");
     }
 
     /// La primera vez que conecta no genera aviso nuevo: de eso ya se

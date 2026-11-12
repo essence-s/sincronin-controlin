@@ -100,6 +100,10 @@ pub enum NetState {
     Desconectado,
     /// Conectado al servidor, esperando al otro equipo.
     Conectando,
+    /// El canal de datos se cortó y se está reintentando.
+    Reconectando,
+    /// Se agotaron los reintentos: hay que volver a emparejar.
+    SinConexion,
     /// El canal de datos está abierto: se puede mandar.
     Conectado,
 }
@@ -208,6 +212,9 @@ pub(crate) enum PeerCommand {
     },
     /// Terminar todos los pares.
     Stop,
+    /// Simular una caída del ICE, para las pruebas de reconexión.
+    #[cfg(test)]
+    SimulateDrop,
 }
 
 /// Lo que el hilo de par le manda al hilo de señalización.
@@ -240,9 +247,18 @@ pub(crate) enum PeerOut {
 ///
 /// `cmd_rx` trae los comandos de la UI y `sink` publica los eventos.
 pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
+    let _ = spawn_with_peer_tx(cmd_rx, sink);
+}
+
+/// Levanta los dos hilos y devuelve el canal del hilo de par.
+///
+/// Solo las pruebas necesitan hablarle directo al hilo de par (para
+/// simular una caída del ICE).
+fn spawn_with_peer_tx(cmd_rx: Receiver<Command>, sink: Sink) -> Sender<PeerCommand> {
     // Los canales entre los dos hilos.
     let (peer_cmd_tx, peer_cmd_rx) = unbounded::<PeerCommand>();
     let (peer_out_tx, peer_out_rx) = unbounded::<PeerOut>();
+    let peer_tx = peer_cmd_tx.clone();
 
     // El hilo de señalización: habla con la UI y con el servidor.
     let sink_signal = Arc::clone(&sink);
@@ -265,6 +281,8 @@ pub fn spawn(cmd_rx: Receiver<Command>, sink: Sink) {
             }
         })
         .expect("no se pudo crear el hilo de par");
+
+    peer_tx
 }
 
 /// El código de sala de este cliente.
@@ -448,6 +466,9 @@ mod tests {
 
     /// La sala del test de fallback entre varios STUN.
     const STUN_FALLBACK_ROOM: &str = "R5T7VX";
+
+    /// La sala del test de reconexión tras un corte.
+    const RECONNECT_ROOM: &str = "G5K7MN";
 
     /// La sala del test del diagnóstico de red.
     const DIAGNOSTIC_ROOM: &str = "P4W6YZ";
@@ -840,6 +861,74 @@ mod tests {
         });
     }
 
+    /// Un corte simulado: el controlado reinicia el ICE y la sesión vuelve
+    /// sola, sin volver a emparejar.
+    #[test]
+    fn the_session_reconnects_after_a_simulated_drop() {
+        let _ = test_server();
+
+        let (cmd_a, peer_a, events_a) = client_with_peer();
+        let (cmd_b, peer_b, events_b) = client_with_peer();
+
+        cmd_a
+            .send(Command::Connect {
+                room: RECONNECT_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+        cmd_b
+            .send(Command::Connect {
+                room: RECONNECT_ROOM.to_string(),
+            })
+            .expect("el canal de comandos está abierto");
+
+        wait_for(&events_a, channel_opened);
+        wait_for(&events_b, channel_opened);
+        wait_for(&events_a, |events| last_role(events).is_some());
+        wait_for(&events_b, |events| last_role(events).is_some());
+
+        // El que entró primero es el controlado: es el único que puede
+        // ofrecer, así que la caída se simula de su lado.
+        let a_is_controlled = last_role(&events_a.lock().expect("el registro no está poisoned"))
+            == Some(Role::Controlado);
+        let (cmd_send, peer, controlled_events, other_events) = if a_is_controlled {
+            (cmd_a, peer_a, events_a, events_b)
+        } else {
+            (cmd_b, peer_b, events_b, events_a)
+        };
+
+        peer.send(PeerCommand::SimulateDrop)
+            .expect("el hilo de par sigue escuchando");
+
+        wait_for(&controlled_events, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::State(NetState::Reconectando)))
+        });
+
+        // La oferta del restart sale y la conexión vuelve.
+        wait_for(&controlled_events, |events| {
+            let drop = events
+                .iter()
+                .position(|event| matches!(event, Event::State(NetState::Reconectando)));
+            drop.is_some_and(|index| {
+                events[index..]
+                    .iter()
+                    .any(|event| matches!(event, Event::State(NetState::Conectado)))
+            })
+        });
+
+        // El canal vuelve a llevar mensajes, sin un Connect nuevo.
+        cmd_send
+            .send(Command::Send("hola".to_string()))
+            .expect("el canal de comandos está abierto");
+
+        wait_for(&other_events, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Message(text) if text == "hola"))
+        });
+    }
+
     /// Con dos STUN configurados y uno mudo, el otro contesta: el
     /// emparejamiento no espera al que no habla.
     #[test]
@@ -1152,6 +1241,14 @@ mod tests {
             .any(|event| matches!(event, Event::AssignedRole(Role::Controlado)))
     }
 
+    /// El último rol que el servidor le asignó al cliente.
+    fn last_role(events: &[Event]) -> Option<Role> {
+        events.iter().rev().find_map(|event| match event {
+            Event::AssignedRole(role) => Some(*role),
+            _ => None,
+        })
+    }
+
     /// Si el canal de datos se abrió.
     fn channel_opened(events: &[Event]) -> bool {
         events.iter().any(
@@ -1296,6 +1393,13 @@ mod tests {
     /// Un cliente de red: el canal de comandos y donde se anotan los
     /// eventos.
     fn client() -> (Sender<Command>, Arc<Mutex<Vec<Event>>>) {
+        let (cmd_tx, _peer_tx, events) = client_with_peer();
+        (cmd_tx, events)
+    }
+
+    /// Un cliente con acceso al hilo de par, para disparar una caída
+    /// simulada.
+    fn client_with_peer() -> (Sender<Command>, Sender<PeerCommand>, Arc<Mutex<Vec<Event>>>) {
         let (cmd_tx, cmd_rx) = unbounded();
         let events = Arc::new(Mutex::new(Vec::new()));
 
@@ -1307,9 +1411,9 @@ mod tests {
                 .push(event);
         });
 
-        spawn(cmd_rx, sink);
+        let peer_tx = spawn_with_peer_tx(cmd_rx, sink);
 
-        (cmd_tx, events)
+        (cmd_tx, peer_tx, events)
     }
 
     /// Espera a que se cumpla una condición sobre los eventos.

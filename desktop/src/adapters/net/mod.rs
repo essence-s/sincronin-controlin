@@ -133,6 +133,8 @@ fn translate(event: NetRawEvent) -> NetEvent {
         NetRawEvent::State(state) => NetEvent::State(match state {
             RawNetState::Desconectado => crate::domain::net::NetState::Desconectado,
             RawNetState::Conectando => crate::domain::net::NetState::Conectando,
+            RawNetState::Reconectando => crate::domain::net::NetState::Reconectando,
+            RawNetState::SinConexion => crate::domain::net::NetState::SinConexion,
             RawNetState::Conectado => crate::domain::net::NetState::Conectado,
         }),
         NetRawEvent::Message(text) => NetEvent::Message(text),

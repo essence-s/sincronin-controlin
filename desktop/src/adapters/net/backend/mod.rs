@@ -82,6 +82,8 @@ pub enum Command {
     Send(String),
     /// Salir de la sala.
     Disconnect,
+    /// La red del sistema cambió: hay que reenumerar las interfaces.
+    NetworkChanged,
 }
 
 /// El rol del cliente en la sala.
@@ -197,6 +199,8 @@ pub(crate) enum PeerCommand {
     },
     /// Mandar un mensaje por todos los canales abiertos.
     Send(String),
+    /// La red cambió: vuelve a enumerar las interfaces y anunciar lo nuevo.
+    NetworkChanged,
     /// Cerrar el par de un equipo: se fue de la sala.
     Close {
         /// Identificador del equipo que se fue.

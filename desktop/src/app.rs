@@ -64,6 +64,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
         }));
     }
 
+    // ── Cambios de red → adaptador de red ─────────────────────────────
+    // El hilo de vigilancia vive lo que vive la app: cuando cambia una
+    // interfaz, cada par reenumera y anuncia los enlaces nuevos.
+    {
+        let net = net.clone();
+        platform::spawn_network_watch(move || net.network_changed());
+    }
+
     // ── Entrada de la UI → servicios ──────────────────────────────────
     let app: Arc<dyn AppPort> = Arc::new(AppController::new(Arc::clone(&state), pairing, ui_port));
     SlintAdapter::wire(&ui, Arc::clone(&app));

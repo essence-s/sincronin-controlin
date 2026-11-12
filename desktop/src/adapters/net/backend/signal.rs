@@ -375,6 +375,11 @@ fn handle_command(session: &mut Session, cmd: Command, peer_tx: &Sender<PeerComm
             net::publish_state(sink, NetState::Desconectado);
             net::publish_notice(sink, "se cortó la conexión");
         }
+        Command::NetworkChanged => {
+            // El hilo de par reenumera: acá no hay nada que tocar, porque
+            // la señalización no depende de las interfaces locales.
+            net::send_peer(peer_tx, PeerCommand::NetworkChanged);
+        }
     }
 }
 

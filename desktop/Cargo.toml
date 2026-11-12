@@ -37,6 +37,10 @@ windows = { version = "0.62.2", features = [
     "Media_Control",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
+    # Para escuchar los cambios de interfaz de red.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     # Para traducir el AUMID de una sesión al nombre de la app.
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
@@ -51,6 +55,8 @@ raw-window-handle = "0.6"
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris = "2"
 dbus = "0.9"
+# Para escuchar los cambios de interfaz de red por netlink.
+libc = "0.2"
 
 [build-dependencies]
 slint-build = "1.18.1"

@@ -87,3 +87,9 @@ pub fn reposition(_ui: &AppWindow) {}
 pub fn animates_resize() -> bool {
     true
 }
+
+/// No-op: esta plataforma no tiene backend para observar la red.
+///
+/// Existe para que [`super::spawn_network_watch`] compile sin plataforma
+/// real; el stub no detecta cambios.
+pub fn spawn_network_source(_tx: crossbeam_channel::Sender<()>) {}

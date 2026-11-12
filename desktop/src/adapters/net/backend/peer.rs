@@ -1,19 +1,32 @@
-//! El hilo de par: el `Rtc` de str0m y el socket UDP.
+//! El hilo de par: el `Rtc` de str0m y los sockets UDP.
 //!
 //! Es el único que toca la conexión punto a punto. El bucle es el
 //! canónico de `str0m`: se le pide que produzca una salida, se manda lo
-//! que pida y se le pasa lo que llega del socket.
+//! que pida y se le pasa lo que llega de los sockets.
 //!
-//! ## El candidato local
+//! ## Los candidatos locales
 //!
-//! Se anuncian **dos, a partir de un mismo socket**: host (la dirección
-//! del socket) y server reflexive (la dirección pública que el STUN
-//! revela, para cruzar un NAT). El socket se abre en la dirección de red
-//! que toca —el agente ICE descarta los paquetes STUN que llegan a una
+//! Por cada interfaz usable (IPv4 e IPv6, sin loopback ni link-local) se
+//! abre un socket, y de cada socket salen **dos candidatos**: host (la
+//! dirección del socket) y server reflexive (la dirección pública que el
+//! STUN revela, para cruzar un NAT). El socket se abre en la dirección de
+//! red que toca —el agente ICE descarta los paquetes STUN que llegan a una
 //! dirección que no sea uno de sus candidatos, y un socket en `0.0.0.0`
 //! no sirve— y el paquete que llega a la dirección pública lo reenvía el
-//! NAT hacia acá. Anunciar varias interfaces requiere un socket por cada
-//! una: eso queda para otra versión.
+//! NAT hacia acá.
+//!
+//! Cada paquete que produce str0m sale por el socket de su dirección de
+//! origen: con varias interfaces, ese es el enlace que el sistema eligió
+//! para salir. Si el origen es un srflx no hay socket propio: el paquete
+//! vuelve por el de la interfaz de su base.
+//!
+//! ## Los cambios de red
+//!
+//! Cuando el sistema avisa que cambió una interfaz (netlink en Linux,
+//! `NotifyIpInterfaceChange` en Windows), el hilo vuelve a enumerar y abre
+//! un socket por cada dirección nueva, que se anuncia por trickle. Los
+//! enlaces viejos no se cierran: reemplazarlos queda para cuando haya
+//! ICE restart.
 //!
 //! ## El STUN
 //!
@@ -30,7 +43,7 @@
 //! ## Un par por equipo
 //!
 //! El controlado sostiene un par por cada controlador de su sala, cada uno
-//! con su socket y su STUN. El controlador tiene uno solo, contra el
+//! con sus sockets y su STUN. El controlador tiene uno solo, contra el
 //! controlado: solo el controlado ofrece, así que dos controladores nunca
 //! abren un par entre sí.
 //!
@@ -53,7 +66,7 @@ use rand::Rng;
 use serde_json::Value;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::channel::{ChannelConfig, ChannelId, Reliability};
-use str0m::net::{Protocol, Receive};
+use str0m::net::{Protocol, Receive, Transmit};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 
 use crate::adapters::net::backend::{
@@ -108,26 +121,12 @@ struct Session {
     peer: u64,
     /// El estado de WebRTC.
     rtc: Rtc,
-    /// El socket UDP.
-    socket: UdpSocket,
+    /// Los enlaces de red: un socket por interfaz usable.
+    links: Vec<Link>,
     /// La oferta que mandamos, esperando la respuesta.
     pending: Option<SdpPendingOffer>,
     /// El canal de datos, cuando se abre.
     channel: Option<ChannelId>,
-    /// Los bindings STUN en curso: uno por cada servidor configurado.
-    stun: Option<Vec<StunQuery>>,
-    /// Las direcciones mapeadas que contestaron, para clasificar el NAT.
-    mappings: Vec<SocketAddr>,
-    /// Los candidatos locales que faltan anunciar.
-    ///
-    /// El host entra al abrir la sesión; el server reflexive si el STUN
-    /// contesta.
-    local: Vec<Candidate>,
-    /// Los candidatos locales ya anunciados, para el diagnóstico.
-    announced: Vec<SocketAddr>,
-    /// Si ya se anunció lo que había tras el SDP: los candidatos que
-    /// llegan después (un srflx a destiempo) se anuncian al momento.
-    trickled: bool,
     /// Si ya mandamos una oferta: para no mandar dos.
     offered: bool,
     /// Si ya avisó que la conexión se interrumpió.
@@ -136,6 +135,28 @@ struct Session {
     /// que la vuelta, si llega, también avise, y así el panel no queda
     /// con una falla que ya no vale.
     dropped: bool,
+}
+
+/// Un enlace de red: un socket y los candidatos que salen de él.
+struct Link {
+    /// El socket UDP.
+    socket: UdpSocket,
+    /// La dirección local del socket: la base de sus candidatos.
+    base: SocketAddr,
+    /// Los bindings STUN en curso: uno por cada servidor configurado.
+    stun: Option<Vec<StunQuery>>,
+    /// Las direcciones mapeadas que contestaron, para clasificar el NAT.
+    mappings: Vec<SocketAddr>,
+    /// Los candidatos locales que faltan anunciar.
+    ///
+    /// El host entra al abrir el enlace; el server reflexive si el STUN
+    /// contesta.
+    local: Vec<Candidate>,
+    /// Los candidatos de este enlace ya anunciados, para el diagnóstico.
+    announced: Vec<SocketAddr>,
+    /// Si ya se anunció lo que había tras el SDP: los candidatos que
+    /// llegan después (un srflx a destiempo) se anuncian al momento.
+    trickled: bool,
 }
 
 /// El binding STUN en curso contra el servidor.
@@ -249,20 +270,43 @@ fn pump(current: &mut Session, sink: &Sink) -> Result<Instant, RtcError> {
                 }
                 current.rtc.handle_input(Input::Timeout(now))?;
             }
-            Output::Transmit(transmit) => {
-                if let Err(err) = current
-                    .socket
-                    .send_to(&transmit.contents, transmit.destination)
-                {
-                    eprintln!("[net] no se pudo mandar el paquete: {err}");
-                }
-            }
+            Output::Transmit(transmit) => send_transmit(&current.links, transmit),
             Output::Event(event) => handle_event(event, current, sink),
         }
     }
 }
 
-/// Espera un datagrama en el socket del par y se lo pasa a str0m.
+/// Manda un paquete por el socket del enlace de su dirección de origen.
+///
+/// str0m marca como origen la base del candidato local, así que el enlace
+/// se busca por esa dirección exacta. Un srflx no tiene socket propio: se
+/// cae al enlace de la misma IP, que es por donde el NAT reenvía hacia acá.
+fn send_transmit(links: &[Link], transmit: Transmit) {
+    let Some(link) = link_for_source(links, transmit.source) else {
+        eprintln!(
+            "[net] no hay socket para el origen {}: se pierde el paquete",
+            transmit.source
+        );
+        return;
+    };
+
+    if let Err(err) = link
+        .socket
+        .send_to(&transmit.contents, transmit.destination)
+    {
+        eprintln!("[net] no se pudo mandar el paquete: {err}");
+    }
+}
+
+/// El enlace por el que tiene que salir un paquete.
+fn link_for_source(links: &[Link], source: SocketAddr) -> Option<&Link> {
+    links
+        .iter()
+        .find(|link| link.base == source)
+        .or_else(|| links.iter().find(|link| link.base.ip() == source.ip()))
+}
+
+/// Espera un datagrama en cada socket del par y se los pasa a str0m.
 ///
 /// Si el plazo se cumple sin nada, no hay nada que avisarle: el `pump` de
 /// la vuelta siguiente ve si ya le tocaba despertarse.
@@ -273,40 +317,46 @@ fn read_once(
     out_tx: &Sender<PeerOut>,
     sink: &Sink,
 ) -> Result<(), RtcError> {
-    current.socket.set_read_timeout(Some(wait))?;
+    // El plazo se reparte entre los enlaces: uno con datos no deja
+    // esperando a los demás.
+    let slice = (wait / current.links.len() as u32)
+        .max(Duration::from_millis(1))
+        .min(wait);
 
-    // El buffer tiene que estar listo antes de recibir: con un buffer
-    // vacío el datagram se trunca a cero bytes.
-    buf.resize(BUFFER_SIZE, 0);
+    for index in 0..current.links.len() {
+        current.links[index].socket.set_read_timeout(Some(slice))?;
 
-    let input = match current.socket.recv_from(buf) {
-        Ok((n, source)) => {
-            buf.truncate(n);
+        // El buffer tiene que estar listo antes de recibir: con un buffer
+        // vacío el datagram se trunca a cero bytes.
+        buf.resize(BUFFER_SIZE, 0);
 
-            // Si es la respuesta a nuestro binding STUN, la maneja el
-            // hilo de par: no llega al `Rtc`.
-            if handle_stun_reply(current, source, buf, out_tx, sink) {
-                return Ok(());
+        let (n, source) = match current.links[index].socket.recv_from(buf) {
+            Ok(received) => received,
+            // Se cumplio el timeout del socket: no hay nada para str0m.
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                continue;
             }
+            Err(err) => return Err(err.into()),
+        };
+        buf.truncate(n);
 
-            Input::Receive(
-                Instant::now(),
-                Receive {
-                    proto: Protocol::Udp,
-                    source,
-                    destination: current.socket.local_addr()?,
-                    contents: buf.as_slice().try_into()?,
-                },
-            )
+        // Si es la respuesta a nuestro binding STUN, la maneja el hilo
+        // de par: no llega al `Rtc`.
+        if handle_stun_reply(current, index, source, buf, out_tx, sink) {
+            continue;
         }
-        // Se cumplio el timeout del socket: no hay nada para str0m.
-        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
 
-    current.rtc.handle_input(input)?;
+        let destination = current.links[index].base;
+        current.rtc.handle_input(Input::Receive(
+            Instant::now(),
+            Receive {
+                proto: Protocol::Udp,
+                source,
+                destination,
+                contents: buf.as_slice().try_into()?,
+            },
+        ))?;
+    }
 
     Ok(())
 }
@@ -317,45 +367,56 @@ fn read_once(
 /// cuando venció su intervalo, como retransmite ICE. Cada servidor lleva
 /// su propio conteo: uno mudo no frena a los demás.
 fn maintain_stun(current: &mut Session, sink: &Sink) {
-    let Some(queries) = current.stun.take() else {
-        return;
-    };
-
-    let mut active = Vec::new();
     let mut gave_up = false;
 
-    for mut query in queries {
-        if query.sent_at.elapsed() < STUN_RETRY {
+    for link in &mut current.links {
+        let Some(queries) = link.stun.take() else {
+            continue;
+        };
+
+        let mut active = Vec::new();
+
+        for mut query in queries {
+            if query.sent_at.elapsed() < STUN_RETRY {
+                active.push(query);
+                continue;
+            }
+
+            if query.attempts >= STUN_ATTEMPTS {
+                gave_up = true;
+                continue;
+            }
+
+            query.attempts += 1;
+            query.sent_at = Instant::now();
+
+            if let Err(err) = link.socket.send_to(&query.request, query.server) {
+                eprintln!("[net] no se pudo reenviar el binding STUN: {err}");
+            }
+
             active.push(query);
-            continue;
         }
 
-        if query.attempts >= STUN_ATTEMPTS {
-            gave_up = true;
-            continue;
+        // Si no queda ninguno, `link.stun` queda en `None`: no hay más
+        // bindings en curso en este enlace.
+        if !active.is_empty() {
+            link.stun = Some(active);
         }
-
-        query.attempts += 1;
-        query.sent_at = Instant::now();
-
-        if let Err(err) = current.socket.send_to(&query.request, query.server) {
-            eprintln!("[net] no se pudo reenviar el binding STUN: {err}");
-        }
-
-        active.push(query);
     }
 
-    if active.is_empty() {
-        if gave_up && current.mappings.is_empty() {
-            eprintln!("[net] ningún servidor STUN contesta: queda solo el candidato host");
-            net::publish_notice(
-                sink,
-                "el servidor STUN no contesta: sin dirección pública no hay camino a través del NAT",
-            );
-        }
-        // `current.stun` queda en `None`: no hay más bindings en curso.
-    } else {
-        current.stun = Some(active);
+    // El aviso es uno solo, y recién cuando no queda ningún binding en
+    // curso ni ninguna dirección mapeada: un enlace mudo no condena a los
+    // demás.
+    let any_pending = current
+        .links
+        .iter()
+        .any(|link| link.stun.is_some() || !link.mappings.is_empty());
+    if gave_up && !any_pending {
+        eprintln!("[net] ningún servidor STUN contesta: queda solo el candidato host");
+        net::publish_notice(
+            sink,
+            "el servidor STUN no contesta: sin dirección pública no hay camino a través del NAT",
+        );
     }
 }
 
@@ -363,15 +424,17 @@ fn maintain_stun(current: &mut Session, sink: &Sink) {
 /// bindings STUN.
 ///
 /// Devuelve `true` si lo era: entonces lo maneja acá y no se le pasa a
-/// str0m. Si no, sigue de largo por el camino de siempre.
+/// str0m. El binding pertenece al enlace por el que llegó: la respuesta
+/// del servidor vuelve al socket que la mandó.
 fn handle_stun_reply(
     current: &mut Session,
+    index: usize,
     source: SocketAddr,
     buf: &[u8],
     out_tx: &Sender<PeerOut>,
     sink: &Sink,
 ) -> bool {
-    let Some(request) = current.stun.as_ref().and_then(|queries| {
+    let Some(request) = current.links[index].stun.as_ref().and_then(|queries| {
         queries
             .iter()
             .find(|query| {
@@ -391,22 +454,26 @@ fn handle_stun_reply(
 
     // Era nuestra: cierra esa transacción, para no volver a retransmitir
     // ni tratar de leer una segunda contestación del mismo servidor.
-    let empty = if let Some(queries) = current.stun.as_mut() {
+    let empty = if let Some(queries) = current.links[index].stun.as_mut() {
         queries.retain(|query| !(query.server == source && query.request[8..20] == request[8..20]));
         queries.is_empty()
     } else {
         false
     };
     if empty {
-        current.stun = None;
+        current.links[index].stun = None;
     }
 
     match reply {
         StunReply::Mapped(mapped) => {
-            let first = current.mappings.is_empty();
+            // El aviso es uno por sesión, no uno por enlace: con varias
+            // interfaces el panel no se llena de direcciones públicas.
+            let first = current.links.iter().all(|link| link.mappings.is_empty());
+
+            let link = &mut current.links[index];
             // Una entrada por servidor que contestó, aunque coincidan: dos
             // mapeos iguales son justamente lo que distingue un NAT estable.
-            current.mappings.push(mapped);
+            link.mappings.push(mapped);
 
             if first {
                 eprintln!("[net] STUN: el NAT nos mapea a {mapped}");
@@ -416,18 +483,11 @@ fn handle_stun_reply(
                 );
             }
 
-            let base = match current.socket.local_addr() {
-                Ok(base) => base,
-                Err(err) => {
-                    eprintln!("[net] no se pudo leer la dirección del socket: {err}");
-                    return true;
-                }
-            };
-
-            // Un solo srflx alcanza: los mapeos distintos no abren más
-            // caminos sin TURN, y anunciar varios solo agrega checks.
-            if first {
-                let candidate = match Candidate::server_reflexive(mapped, base, "udp") {
+            // Un solo srflx por enlace alcanza: los mapeos distintos no
+            // abren más caminos sin TURN, y anunciar varios solo agrega
+            // checks.
+            if link.mappings.len() == 1 {
+                let candidate = match Candidate::server_reflexive(mapped, link.base, "udp") {
                     Ok(candidate) => candidate,
                     Err(err) => {
                         eprintln!("[net] no se pudo armar el candidato srflx: {err}");
@@ -435,11 +495,17 @@ fn handle_stun_reply(
                     }
                 };
 
-                if current.trickled {
+                if link.trickled {
                     // El SDP ya va por señalización: se anuncia solo.
-                    add_and_send_local_candidate(current, candidate, out_tx);
+                    announce_link_candidate(
+                        link,
+                        &mut current.rtc,
+                        current.peer,
+                        candidate,
+                        out_tx,
+                    );
                 } else {
-                    current.local.push(candidate);
+                    link.local.push(candidate);
                 }
             }
 
@@ -636,6 +702,15 @@ fn handle_command(
             // de escribir otra vez.
             false
         }
+        PeerCommand::NetworkChanged => {
+            // El sistema avisó que cambió una interfaz: se enumeran las
+            // direcciones y cada par abre los enlaces que le faltan.
+            let addresses = local_addresses();
+            for current in sessions.values_mut() {
+                refresh_links(current, &addresses, out_tx, sink);
+            }
+            true
+        }
         PeerCommand::Close { peer } => {
             // Se cae el par de ese equipo: su socket se cierra y los demás
             // siguen como estaban.
@@ -648,6 +723,11 @@ fn handle_command(
             true
         }
     }
+}
+
+/// Abre un socket por cada dirección usable y prepara el `Rtc`.
+fn start(peer: u64) -> io::Result<Session> {
+    start_with(peer, &local_addresses())
 }
 
 /// El par con un equipo; si todavía no hay, lo abre.
@@ -677,32 +757,64 @@ fn session_for<'a>(
     }
 }
 
-/// Abre el socket UDP y prepara el `Rtc`.
-fn start(peer: u64) -> io::Result<Session> {
-    let socket = UdpSocket::bind(local_address()?)?;
-    let local_addr = socket.local_addr()?;
-
-    let rtc = Rtc::new(Instant::now());
-    let host = Candidate::host(local_addr, "udp")
-        .map_err(|err| io::Error::other(format!("no se pudo crear el candidato local: {err}")))?;
-
-    eprintln!("[net] socket UDP en {local_addr}");
-
-    let stun = start_stun(&socket, local_addr);
-
+/// Arma la sesión con los enlaces de las direcciones dadas.
+fn start_with(peer: u64, addresses: &[IpAddr]) -> io::Result<Session> {
     Ok(Session {
         peer,
-        rtc,
-        socket,
+        rtc: Rtc::new(Instant::now()),
+        links: open_links(addresses)?,
         pending: None,
         channel: None,
+        offered: false,
+        dropped: false,
+    })
+}
+
+/// Abre un enlace por cada dirección.
+///
+/// Una interfaz que no se puede atar no condena a las demás: se avisa y se
+/// sigue con las que sí. Solo es un error que no quede ninguna.
+fn open_links(addresses: &[IpAddr]) -> io::Result<Vec<Link>> {
+    let mut links = Vec::new();
+    let mut last_err = None;
+
+    for &ip in addresses {
+        match open_link(ip) {
+            Ok(link) => links.push(link),
+            Err(err) => {
+                eprintln!("[net] no se pudo abrir el socket en {ip}: {err}");
+                last_err = Some(err);
+            }
+        }
+    }
+
+    if links.is_empty() {
+        return Err(last_err.unwrap_or_else(|| io::Error::other("no hay interfaces usables")));
+    }
+
+    Ok(links)
+}
+
+/// Abre el socket de una interfaz y arranca su STUN.
+fn open_link(ip: IpAddr) -> io::Result<Link> {
+    let socket = UdpSocket::bind(SocketAddr::new(ip, 0))?;
+    let base = socket.local_addr()?;
+
+    let host = Candidate::host(base, "udp")
+        .map_err(|err| io::Error::other(format!("no se pudo crear el candidato local: {err}")))?;
+
+    eprintln!("[net] socket UDP en {base}");
+
+    let stun = start_stun(&socket, base);
+
+    Ok(Link {
+        socket,
+        base,
         stun,
         mappings: Vec::new(),
         local: vec![host],
         announced: Vec::new(),
         trickled: false,
-        offered: false,
-        dropped: false,
     })
 }
 
@@ -896,19 +1008,24 @@ fn accept_answer(current: &mut Session, sdp: &Value) -> Result<(), RtcError> {
     Ok(())
 }
 
-/// Anuncia los candidatos locales listos.
+/// Anuncia los candidatos locales listos de todos los enlaces.
 ///
 /// Se hace después de armar el SDP a propósito: los candidatos viajan como
 /// mensajes `ice` (trickle), no embebidos en el SDP. También queda
-/// marcado: si llega otro candidato (el srflx del STUN) se anuncia solo.
+/// marcado: si llega otro candidato (el srflx del STUN), se anuncia solo.
 fn trickle_local_candidates(current: &mut Session, out_tx: &Sender<PeerOut>, sink: &Sink) {
-    let queued = std::mem::take(&mut current.local);
+    let Session {
+        links, rtc, peer, ..
+    } = current;
 
-    for candidate in queued {
-        add_and_send_local_candidate(current, candidate, out_tx);
+    for link in links.iter_mut() {
+        let queued = std::mem::take(&mut link.local);
+        for candidate in queued {
+            announce_link_candidate(link, rtc, *peer, candidate, out_tx);
+        }
+        link.trickled = true;
     }
 
-    current.trickled = true;
     publish_diagnostic(current, sink);
 }
 
@@ -917,27 +1034,86 @@ fn trickle_local_candidates(current: &mut Session, out_tx: &Sender<PeerOut>, sin
 /// `add_local_candidate` le pone el ufrag al candidato: hay que mandar el
 /// que devuelve, no el de entrada. Si el `Rtc` lo rechaza (por redundante,
 /// por ejemplo) no viaja.
-fn add_and_send_local_candidate(
-    current: &mut Session,
+fn announce_link_candidate(
+    link: &mut Link,
+    rtc: &mut Rtc,
+    peer: u64,
     candidate: Candidate,
     out_tx: &Sender<PeerOut>,
 ) {
-    let Some(stored) = current.rtc.add_local_candidate(candidate) else {
+    let Some(stored) = rtc.add_local_candidate(candidate) else {
         eprintln!("[net] el candidato local fue rechazado");
         return;
     };
 
-    current.announced.push(stored.addr());
+    let addr = stored.addr();
 
     match serde_json::to_value(stored) {
         Ok(value) => {
             let _ = out_tx.send(PeerOut::Ice {
-                to: current.peer,
+                to: peer,
                 candidate: value,
             });
         }
         Err(err) => eprintln!("[net] no se pudo serializar el candidato local: {err}"),
     }
+
+    link.announced.push(addr);
+}
+
+/// Vuelve a enumerar los enlaces cuando cambia la red.
+///
+/// Solo suma: un socket viejo sigue escuchando hasta que su par se cierra.
+/// Si el SDP ya salió, el host del enlace nuevo se anuncia al momento; si
+/// no, queda en la cola y sale con la oferta o la respuesta.
+fn refresh_links(
+    current: &mut Session,
+    addresses: &[IpAddr],
+    out_tx: &Sender<PeerOut>,
+    sink: &Sink,
+) {
+    let mut added = Vec::new();
+
+    for &ip in addresses {
+        if current.links.iter().any(|link| link.base.ip() == ip) {
+            continue;
+        }
+
+        match open_link(ip) {
+            Ok(link) => {
+                eprintln!("[net] enlace nuevo: {}", link.base);
+                added.push(link);
+            }
+            Err(err) => eprintln!("[net] no se pudo abrir el socket en {ip}: {err}"),
+        }
+    }
+
+    if added.is_empty() {
+        return;
+    }
+
+    // Si el SDP ya fue, todo candidato que aparezca se anuncia solo.
+    let trickled = current.links.iter().any(|link| link.trickled);
+
+    for mut link in added {
+        if trickled {
+            let queued = std::mem::take(&mut link.local);
+            for candidate in queued {
+                announce_link_candidate(
+                    &mut link,
+                    &mut current.rtc,
+                    current.peer,
+                    candidate,
+                    out_tx,
+                );
+            }
+            link.trickled = true;
+        }
+
+        current.links.push(link);
+    }
+
+    publish_diagnostic(current, sink);
 }
 
 /// Escribe un mensaje en el canal de datos.
@@ -1014,25 +1190,82 @@ fn handle_event(event: Event, current: &mut Session, sink: &Sink) {
     }
 }
 
-/// La dirección donde se abre el socket UDP.
+/// Las direcciones donde se abren los sockets UDP.
 ///
-/// Primero `SINC_NET_ADDR`, después la interfaz con ruta de salida y, si
-/// no hay, la primera IPv4 que no sea de loopback. El loopback es el
-/// último recurso.
-fn local_address() -> io::Result<SocketAddr> {
-    let hint = net::local_address_hint();
-    let routed = if hint.is_none() {
-        route_address()
-    } else {
-        None
-    };
-    let fallback = if hint.is_none() && routed.is_none() {
+/// `SINC_NET_ADDR` fija una sola y saltea el barrido. Si no, la de la ruta
+/// va primero (es la que el panel muestra como principal) y después van
+/// todas las interfaces usables, sin repetir. El loopback es el último
+/// recurso.
+fn local_addresses() -> Vec<IpAddr> {
+    if let Some(hint) = net::local_address_hint() {
+        return vec![hint];
+    }
+
+    let routed = route_address();
+    let fallback = if routed.is_none() {
         first_usable_ipv4()
     } else {
         None
     };
 
-    local_address_with(hint, routed, fallback)
+    let primary = local_address_with(None, routed, fallback)
+        .expect("el último recurso siempre da una dirección");
+
+    let mut addresses = vec![primary.ip()];
+    addresses.extend(usable_addresses(interface_addresses()));
+
+    let mut unique = Vec::new();
+    addresses.retain(|ip| {
+        if unique.contains(ip) {
+            false
+        } else {
+            unique.push(*ip);
+            true
+        }
+    });
+
+    unique
+}
+
+/// Las direcciones de todas las interfaces de la máquina.
+fn interface_addresses() -> Vec<IpAddr> {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces
+                .into_iter()
+                .map(|interface| interface.ip())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Descarta las direcciones que no sirven para anunciarse a otro equipo y
+/// quita las repetidas, conservando el orden.
+///
+/// IPv4 e IPv6 valen igual: la que no tenga camino simplemente no conecta,
+/// y ICE elige. Una link-local no cruza el router, y el loopback no sale
+/// de la máquina.
+fn usable_addresses(addresses: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let mut unique = Vec::new();
+
+    for ip in addresses {
+        if ip.is_unspecified() || ip.is_loopback() || is_link_local(ip) {
+            continue;
+        }
+        if !unique.contains(&ip) {
+            unique.push(ip);
+        }
+    }
+
+    unique
+}
+
+/// Una link-local no cruza el router: `169.254.0.0/16` o `fe80::/10`.
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
 }
 
 /// Elige la dirección del socket: el override, la de la ruta y, si no, la
@@ -1170,19 +1403,47 @@ fn classify_nat(mappings: &[SocketAddr]) -> NatMapping {
 }
 
 /// Publica el diagnóstico de red de la sesión.
+///
+/// Es una sola línea en el panel: la interfaz principal (la del primer
+/// enlace, que es la de la ruta) y el total de candidatos de todos los
+/// enlaces.
 fn publish_diagnostic(current: &Session, sink: &Sink) {
-    let Ok(local) = current.socket.local_addr() else {
+    let Some(primary) = current.links.first() else {
         return;
     };
 
+    let candidates = current
+        .links
+        .iter()
+        .flat_map(|link| link.announced.iter().copied())
+        .collect();
+
     let diagnostic = NetworkDiagnostic {
-        interface: interface_name(local.ip()),
-        address: Some(local.ip()),
-        nat: classify_nat(&current.mappings),
-        candidates: current.announced.clone(),
+        interface: interface_name(primary.base.ip()),
+        address: Some(primary.base.ip()),
+        nat: session_nat(current),
+        candidates,
     };
 
     net::publish_diagnostic(sink, diagnostic);
+}
+
+/// El mapeo del NAT de toda la sesión.
+///
+/// Cada enlace se compara consigo mismo: dos interfaces pueden tener
+/// direcciones públicas distintas sin que el NAT cambie según el destino.
+fn session_nat(current: &Session) -> NatMapping {
+    let mut result = NatMapping::Unknown;
+
+    for link in &current.links {
+        match classify_nat(&link.mappings) {
+            NatMapping::Unknown => {}
+            NatMapping::Stable => result = NatMapping::Stable,
+            NatMapping::ChangesWithDestination => return NatMapping::ChangesWithDestination,
+        }
+    }
+
+    result
 }
 
 /// El nombre de la interfaz que tiene esa IP.
@@ -1248,6 +1509,157 @@ mod tests {
 
         assert_eq!(usable_ip(loopback), None);
         assert_eq!(usable_ip(lan), Some(lan));
+    }
+
+    /// Solo se anuncian las direcciones que pueden alcanzar a otro equipo:
+    /// nada de loopback, sin asignar ni link-local.
+    #[test]
+    fn only_usable_addresses_are_announced() {
+        let addresses: Vec<IpAddr> = [
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.10.20",
+            "192.0.2.10",
+            "::1",
+            "fe80::1",
+            "2001:db8::1",
+            "192.0.2.10",
+        ]
+        .iter()
+        .map(|text| text.parse().expect("dirección"))
+        .collect();
+
+        let usable = usable_addresses(addresses);
+
+        assert_eq!(
+            usable,
+            vec![
+                "192.0.2.10".parse::<IpAddr>().expect("ip"),
+                "2001:db8::1".parse::<IpAddr>().expect("ip"),
+            ],
+            "quedan las de red, sin repetir"
+        );
+    }
+
+    /// Una dirección por interfaz, un socket por dirección: cada enlace
+    /// ofrece su propio candidato host.
+    #[test]
+    fn each_interface_opens_its_own_socket() {
+        let addresses = loopback_addresses();
+
+        let links = open_links(&addresses).expect("los enlaces");
+
+        assert_eq!(links.len(), addresses.len());
+        for (link, ip) in links.iter().zip(addresses.iter()) {
+            assert_eq!(link.base.ip(), *ip);
+            assert_eq!(link.local.len(), 1, "cada enlace ofrece su host");
+            assert_eq!(link.local[0].addr().ip(), *ip);
+        }
+    }
+
+    /// Cada paquete sale por el socket de su dirección de origen; un
+    /// srflx, que no tiene socket propio, vuelve a su base por IP.
+    #[test]
+    fn an_outgoing_packet_uses_the_socket_of_its_source() {
+        let links = open_links(&loopback_addresses()).expect("los enlaces");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receptor");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout del receptor");
+        let destination = receiver.local_addr().expect("dirección del receptor");
+
+        send_transmit(
+            &links,
+            Transmit {
+                proto: Protocol::Udp,
+                source: links[1].base,
+                destination,
+                contents: vec![1, 2, 3].into(),
+            },
+        );
+
+        let mut buf = [0u8; 16];
+        let (n, source) = receiver.recv_from(&mut buf).expect("llegó el paquete");
+        assert_eq!(n, 3);
+        assert_eq!(
+            source.ip(),
+            links[1].base.ip(),
+            "sale por el enlace de su origen"
+        );
+
+        // El srflx no tiene socket propio: el paquete vuelve a salir por el
+        // socket de la interfaz de su base.
+        let srflx = SocketAddr::new(links[1].base.ip(), 40_000);
+        send_transmit(
+            &links,
+            Transmit {
+                proto: Protocol::Udp,
+                source: srflx,
+                destination,
+                contents: vec![4, 5].into(),
+            },
+        );
+
+        let (_, source) = receiver.recv_from(&mut buf).expect("llegó el srflx");
+        assert_eq!(source.ip(), links[1].base.ip());
+    }
+
+    /// Con IPv6 global se anuncian las dos familias: IPv4 queda como
+    /// respaldo, no se reemplaza.
+    #[test]
+    fn a_global_ipv6_address_is_announced_alongside_ipv4() {
+        let addresses: Vec<IpAddr> = ["192.0.2.10", "2001:db8::1"]
+            .iter()
+            .map(|text| text.parse().expect("dirección"))
+            .collect();
+
+        assert_eq!(usable_addresses(addresses.clone()), addresses);
+    }
+
+    /// Un cambio de red reenumera y anuncia los enlaces nuevos, sin tocar
+    /// los que ya estaban.
+    #[test]
+    fn a_network_change_reannounces_the_links() {
+        let (sink, _events) = test_sink();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let mut session = session_with_links(&["127.0.0.1"]);
+
+        // El SDP ya salió: los candidatos van por trickle.
+        trickle_local_candidates(&mut session, &out_tx, &sink);
+        while out_rx.try_recv().is_ok() {}
+
+        let addresses: Vec<IpAddr> = ["127.0.0.1", "127.0.0.2"]
+            .iter()
+            .map(|text| text.parse().expect("dirección"))
+            .collect();
+        refresh_links(&mut session, &addresses, &out_tx, &sink);
+
+        assert_eq!(session.links.len(), 2, "se sumó el enlace nuevo");
+        assert_eq!(
+            session.links[1].base.ip(),
+            "127.0.0.2".parse::<IpAddr>().expect("ip")
+        );
+
+        let announced: Vec<PeerOut> = out_rx.try_iter().collect();
+        assert_eq!(
+            announced.len(),
+            1,
+            "solo el host del enlace nuevo: {announced:?}"
+        );
+        let PeerOut::Ice { candidate, .. } = &announced[0] else {
+            panic!("no fue un candidato: {announced:?}");
+        };
+        let candidate: Candidate = serde_json::from_value(candidate.clone()).expect("candidato");
+        assert_eq!(candidate.addr(), session.links[1].base);
+    }
+
+    /// Tres direcciones de loopback: alcanzan para abrir sockets sin
+    /// depender de las interfaces de la máquina.
+    fn loopback_addresses() -> Vec<IpAddr> {
+        ["127.0.0.1", "127.0.0.2", "127.0.0.3"]
+            .iter()
+            .map(|text| text.parse().expect("dirección"))
+            .collect()
     }
 
     /// Dos STUN que ven el mismo mapeo: el NAT no cambia la dirección
@@ -1325,24 +1737,47 @@ mod tests {
         assert_eq!(parsed, mapped);
     }
 
-    /// Una sesión despojada: socket y `Rtc` apenas nacidos.
+    /// Una sesión despojada: un enlace en loopback y `Rtc` apenas nacido.
     ///
     /// Alcanza para los avisos: no hay conversación con el otro equipo,
     /// solo eventos de ICE y la rendición del binding STUN.
     fn bare_session(stun: Option<Vec<StunQuery>>) -> Session {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("socket de pruebas");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket de pruebas");
+        let base = socket.local_addr().expect("dirección del socket");
 
         Session {
             peer: 0,
             rtc: Rtc::new(Instant::now()),
-            socket,
+            links: vec![Link {
+                socket,
+                base,
+                stun,
+                mappings: Vec::new(),
+                local: Vec::new(),
+                announced: Vec::new(),
+                trickled: false,
+            }],
             pending: None,
             channel: None,
-            stun,
-            mappings: Vec::new(),
-            local: vec![],
-            announced: Vec::new(),
-            trickled: false,
+            offered: false,
+            dropped: false,
+        }
+    }
+
+    /// Una sesión con un enlace por dirección, sin STUN.
+    fn session_with_links(addresses: &[&str]) -> Session {
+        let ips: Vec<IpAddr> = addresses
+            .iter()
+            .map(|text| text.parse().expect("dirección"))
+            .collect();
+        let links = open_links(&ips).expect("los enlaces");
+
+        Session {
+            peer: 0,
+            rtc: Rtc::new(Instant::now()),
+            links,
+            pending: None,
+            channel: None,
             offered: false,
             dropped: false,
         }
@@ -1495,7 +1930,7 @@ mod tests {
         maintain_stun(&mut session, &sink);
 
         // Se rinde: la transacción no corre más.
-        assert!(session.stun.is_none());
+        assert!(session.links[0].stun.is_none());
 
         let recorded = events.lock().expect("el registro no está poisoned").clone();
         assert_eq!(recorded.len(), 1, "solo el aviso: {recorded:?}");

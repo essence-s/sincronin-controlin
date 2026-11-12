@@ -1025,4 +1025,34 @@ mod tests {
             ["enp3s0 · NAT ok · 1 cand.".to_string()]
         );
     }
+
+    /// Con varios candidatos el diagnóstico sigue en una sola línea: la
+    /// interfaz principal y el total, sin listar cada dirección.
+    #[test]
+    fn the_network_diagnostic_stays_compact_with_several_candidates() {
+        use crate::domain::net::{NatMapping, NetworkDiagnostic};
+
+        let mut h = harness();
+        let diagnostic = NetworkDiagnostic {
+            interface: Some("wlp2s0".to_string()),
+            address: Some("192.168.1.8".parse().expect("ip")),
+            nat: NatMapping::Stable,
+            candidates: vec![
+                "192.168.1.8:50000".parse().expect("dirección"),
+                "203.0.113.7:40000".parse().expect("dirección"),
+                "[2001:db8::1]:50000".parse().expect("dirección"),
+            ],
+        };
+
+        h.service
+            .on_net_event(NetEvent::Diagnostic(diagnostic), Instant::now());
+
+        assert_eq!(
+            h.ui.diagnostics
+                .lock()
+                .expect("la UI no está poisoned")
+                .as_slice(),
+            ["wlp2s0 · NAT ok · 3 cand.".to_string()]
+        );
+    }
 }

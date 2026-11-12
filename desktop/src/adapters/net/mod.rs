@@ -61,6 +61,15 @@ impl NetAdapter {
             }),
         }
     }
+
+    /// Avisa que la red del sistema cambió.
+    ///
+    /// El hilo de pares vuelve a enumerar las interfaces y anuncia los
+    /// candidatos de los enlaces nuevos. No hace falta reingresar el
+    /// código de sala ni reiniciar la aplicación.
+    pub fn network_changed(&self) {
+        let _ = self.inner.cmd_tx.send(Command::NetworkChanged);
+    }
 }
 
 impl NetPort for NetAdapter {
